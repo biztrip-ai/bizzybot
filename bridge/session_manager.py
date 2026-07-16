@@ -339,6 +339,7 @@ class SessionManager:
         extra_args: Optional[dict[str, Optional[str]]] = None,
         system_prompt_append: Optional[str] = None,
         mcp_servers: Optional[dict[str, dict]] = None,
+        max_buffer_size: Optional[int] = None,
     ):
         self._cwd = cwd
         self._permission_mode = permission_mode
@@ -347,6 +348,12 @@ class SessionManager:
         self._extra_args = extra_args or {}
         self._mcp_servers = mcp_servers or {}
         self._system_prompt_append = system_prompt_append
+        # The SDK reads the CLI's stdout as newline-delimited JSON and rejects any
+        # single message larger than this. Image tool_results (e.g. a screenshot
+        # the agent Reads back) base64-encode well past the SDK's 1MB default, so
+        # raise it or a screenshot turn dies with "JSON message exceeded maximum
+        # buffer size". None => SDK default.
+        self._max_buffer_size = max_buffer_size
         self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
         # thread_key -> claude session_id, loaded from the /workspaces volume so a
@@ -392,6 +399,8 @@ class SessionManager:
             kwargs["setting_sources"] = self._setting_sources
         if self._mcp_servers:
             kwargs["mcp_servers"] = self._mcp_servers
+        if self._max_buffer_size:
+            kwargs["max_buffer_size"] = self._max_buffer_size
         if self._extra_args:
             kwargs["extra_args"] = dict(self._extra_args)
         if self._system_prompt_append:

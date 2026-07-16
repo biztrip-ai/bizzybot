@@ -250,6 +250,9 @@ def build_session_manager() -> SessionManager:
         extra_args=extra_args,
         system_prompt_append=SLACK_FORMATTING_PROMPT,
         mcp_servers=mcp_servers,
+        # Screenshots/images the agent Reads back arrive as one big base64 JSON
+        # message; the SDK's 1MB default rejects them. 64MB by default.
+        max_buffer_size=int(os.getenv("CLAUDE_MAX_BUFFER_SIZE", str(64 * 1024 * 1024))),
     )
 
 
