@@ -10,4 +10,5 @@ node_modules/
 .venv/
 __pycache__/
 .bridge-state.json
+.bridge-config.json
 .sessions.json

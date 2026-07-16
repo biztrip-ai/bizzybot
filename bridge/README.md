@@ -16,14 +16,20 @@ keep-alive, and bot-token plumbing. It uses your own local `git`/`gh` auth.
 ## Run
 
 ```bash
-cp .env.example .env      # set CENTRAL_URL and REGISTRATION_TOKEN
 uv run python bridge.py
 ```
+
+On first run it **prompts for your registration token** (get it by signing in at
+the Central dashboard) and caches it in `.bridge-config.json`, so later runs need
+no arguments. `CENTRAL_URL` defaults to the hosted Claudebot — override it (env,
+`.env`, or the saved config) only to point at your own Central. You can also skip
+the prompt by setting `REGISTRATION_TOKEN` in the environment or `.env`.
 
 On start it:
 
 1. **Registers** with Central (`POST /api/register`) using your registration
-   token, and pulls the Slack bot token + WebSocket details.
+   token, and pulls the Slack bot token + WebSocket details. If a cached token is
+   rejected, it re-prompts.
 2. Runs a **preflight** — checks Claude Code (fatal if missing), `gh` auth, and
    git identity (warnings).
 3. Opens the **WebSocket** and replays anything it missed (via the last acked
@@ -40,5 +46,7 @@ On start it:
 
 ## State files (gitignored)
 
+- `.bridge-config.json` — cached registration token (+ Central URL), written on
+  first-run prompt. Holds a secret; kept `0600`.
 - `.bridge-state.json` — last acked event sequence.
 - `.sessions.json` — per-thread Claude session ids (for resume across restarts).

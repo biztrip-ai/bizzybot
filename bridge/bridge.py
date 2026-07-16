@@ -44,6 +44,10 @@ log = logging.getLogger("bridge")
 
 STATE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(STATE_DIR, ".bridge-state.json")
+CONFIG_PATH = os.path.join(STATE_DIR, ".bridge-config.json")
+
+# Default hosted Central. Override with CENTRAL_URL (env/.env) or the saved config.
+DEFAULT_CENTRAL_URL = "https://claudebot-production-34ba.up.railway.app"
 
 SLACK_FORMATTING_PROMPT = """\
 Your replies are posted directly to Slack. Format every response in Slack's
@@ -90,24 +94,82 @@ def _parse_sources(raw: str) -> list[str]:
 # --- Config / registration --------------------------------------------------
 
 
-def _config() -> dict[str, str]:
-    central = (os.getenv("CENTRAL_URL") or "").rstrip("/")
-    token = os.getenv("REGISTRATION_TOKEN") or ""
-    if not central or not token:
+class AuthError(Exception):
+    """Central rejected the registration token."""
+
+
+def _load_local_config() -> dict[str, Any]:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _save_local_config(cfg: dict[str, Any]) -> None:
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(tmp, 0o600)  # holds the registration token (a secret)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as e:
+        log.warning("could not save bridge config: %s", e)
+
+
+def _forget_token() -> None:
+    cfg = _load_local_config()
+    cfg.pop("registration_token", None)
+    _save_local_config(cfg)
+
+
+def resolve_central() -> str:
+    """CENTRAL_URL env > saved config > the default hosted Central."""
+    saved = _load_local_config().get("central_url")
+    return (os.getenv("CENTRAL_URL") or saved or DEFAULT_CENTRAL_URL).rstrip("/")
+
+
+def resolve_token(central: str) -> tuple[str, bool]:
+    """Return (token, from_env). Reads REGISTRATION_TOKEN, then the saved config,
+    then prompts interactively (caching the entered token for next time)."""
+    env = os.getenv("REGISTRATION_TOKEN")
+    if env:
+        return env.strip(), True
+    saved = _load_local_config().get("registration_token")
+    if saved:
+        return saved, False
+    if not sys.stdin.isatty():
         sys.exit(
-            "Missing config. Set CENTRAL_URL and REGISTRATION_TOKEN (env or .env).\n"
-            "  CENTRAL_URL=https://central.example.com\n"
-            "  REGISTRATION_TOKEN=<the token Central showed you>"
+            "No registration token found. Set REGISTRATION_TOKEN (env/.env), or run "
+            "the bridge interactively so it can prompt for one.\n"
+            f"Get a token: sign in at {central} and open your workspace dashboard."
         )
-    return {"central": central, "token": token}
+    token = _prompt_for_token(central)
+    _save_local_config({"registration_token": token, "central_url": central})
+    return token, False
+
+
+def _prompt_for_token(central: str) -> str:
+    print("\n  Claudebot bridge — first-time setup")
+    print(f"  Central: {central}")
+    print(f"  Sign in at {central} and open your dashboard to copy your registration token.\n")
+    try:
+        token = input("  Paste your registration token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.exit("\naborted")
+    if not token:
+        sys.exit("no token entered")
+    return token
 
 
 async def register(http: aiohttp.ClientSession, central: str, token: str) -> dict[str, Any]:
     """Dial home: exchange the registration token for the Slack bot token and
-    WebSocket connection details."""
+    WebSocket connection details. Raises AuthError if the token is rejected."""
     async with http.post(
         f"{central}/api/register", json={"token": token}, ssl=_insecure_tls_ctx(central)
     ) as r:
+        if r.status == 401:
+            raise AuthError(await r.text())
         if r.status != 200:
             body = await r.text()
             sys.exit(f"Registration failed (HTTP {r.status}): {body}")
@@ -447,11 +509,24 @@ async def consume(
 
 
 async def main() -> None:
-    cfg = _config()
+    central = resolve_central()
     preflight()
 
     async with aiohttp.ClientSession() as http:
-        reg = await register(http, cfg["central"], cfg["token"])
+        reg = None
+        while reg is None:
+            token, from_env = resolve_token(central)
+            try:
+                reg = await register(http, central, token)
+            except AuthError as e:
+                if from_env:
+                    sys.exit(f"REGISTRATION_TOKEN was rejected by Central: {e}")
+                _forget_token()
+                if not sys.stdin.isatty():
+                    sys.exit("Saved registration token was rejected; set a valid one and restart.")
+                log.error("that registration token was rejected — let's try another")
+                # loop: resolve_token() will prompt again
+
         slack_token = reg.get("slackBotToken") or os.getenv("SLACK_BOT_TOKEN") or ""
         if not slack_token:
             log.warning("no Slack bot token from Central; replies to Slack will fail until one is configured")
