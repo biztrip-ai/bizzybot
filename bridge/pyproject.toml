@@ -1,0 +1,14 @@
+[project]
+name = "claudebot-bridge"
+version = "0.0.0"
+description = "Claudebot OSS bridge: dials home to Central, receives Slack events over a WebSocket, drives Claude Code."
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "python-dotenv>=1.0.0",
+    "slack-sdk>=3.27.0",
+    "claude-agent-sdk>=0.1.0",
+]
+
+[tool.uv]
+package = false

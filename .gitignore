@@ -1,0 +1,13 @@
+node_modules/
+*.db
+*.db-journal
+*.db-wal
+.env
+.certs/
+.DS_Store
+
+# bridge (python)
+.venv/
+__pycache__/
+.bridge-state.json
+.sessions.json
