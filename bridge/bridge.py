@@ -258,12 +258,39 @@ def build_session_manager() -> SessionManager:
 _IGNORED_SUBTYPES = {"bot_message", "message_changed", "message_deleted", "channel_join"}
 _MENTION_RE = None  # compiled lazily once we know the bot user id is not needed
 
+_bot_user_id: Optional[str] = None
+_bot_user_id_lock = asyncio.Lock()
 
-def normalize_slack_event(event: dict[str, Any]) -> Optional[dict[str, Any]]:
+
+async def get_bot_user_id(slack: AsyncWebClient) -> Optional[str]:
+    """The bot's own Slack user id, cached. Used to skip channel replies that
+    re-@mention the bot (the app_mention event handles those). Returns None if
+    it can't be resolved yet — callers must tolerate that."""
+    global _bot_user_id
+    if _bot_user_id is None:
+        async with _bot_user_id_lock:
+            if _bot_user_id is None:
+                try:
+                    auth = await slack.auth_test()
+                    _bot_user_id = auth.get("user_id")
+                except Exception:  # noqa: BLE001
+                    log.warning("auth_test failed; can't resolve bot user id yet", exc_info=True)
+    return _bot_user_id
+
+
+def normalize_slack_event(
+    event: dict[str, Any], bot_user_id: Optional[str] = None
+) -> Optional[dict[str, Any]]:
     """Turn a raw Slack event into the message payload the handler wants, or
     None if we should ignore it (bot echoes, edits, non-addressed channel chatter).
 
-    We respond to: app_mention events, and direct-message ('im') messages.
+    We respond to:
+      - app_mention events (opening turn / re-summoning the bot),
+      - direct-message ('im') messages,
+      - replies typed into a channel/group thread the bot is already engaged in
+        (no re-@mention needed). Those come as plain `message` events; we tag
+        them `needs_active_session` so the caller only wakes on threads with a
+        live session.
     """
     if not isinstance(event, dict) or event.get("bot_id"):
         return None
@@ -272,10 +299,21 @@ def normalize_slack_event(event: dict[str, Any]) -> Optional[dict[str, Any]]:
 
     etype = event.get("type")
     channel_type = event.get("channel_type")
+    needs_active_session = False
     if etype == "app_mention":
         pass
     elif etype == "message" and channel_type == "im":
         pass
+    elif (
+        etype == "message"
+        and channel_type in ("channel", "group", "mpim")
+        and event.get("thread_ts")
+    ):
+        # A reply inside a channel/private thread. If it re-@mentions the bot,
+        # the app_mention event covers it — skip here to avoid double-handling.
+        if bot_user_id and f"<@{bot_user_id}>" in (event.get("text") or ""):
+            return None
+        needs_active_session = True
     else:
         return None
 
@@ -296,6 +334,7 @@ def normalize_slack_event(event: dict[str, Any]) -> Optional[dict[str, Any]]:
         "reply_thread_ts": thread_ts,
         "text": text,
         "files": event.get("files") or [],
+        "needs_active_session": needs_active_session,
     }
 
 
@@ -381,9 +420,16 @@ META_COMMANDS: dict[str, tuple[Callable[..., Awaitable[None]], str]] = {
 
 async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWebClient) -> None:
     """Handle one Slack event delivered by Central."""
-    msg = normalize_slack_event(payload)
+    bot_user_id = await get_bot_user_id(slack)
+    msg = normalize_slack_event(payload, bot_user_id)
     if msg is None:
         return  # not addressed to us / an echo — ignore (still acked)
+    # A bare channel-thread reply only wakes the bot if it's already engaged in
+    # that thread (a live session). Otherwise any reply in any channel the bot
+    # sits in would trigger it. The app_mention path is what first creates the
+    # session, so this gate opens naturally after the bot is summoned once.
+    if msg.pop("needs_active_session", False) and not sessions.exists(msg["thread_key"]):
+        return
     meta = META_COMMANDS.get((msg.get("text") or "").strip().lower())
     if meta:
         await meta[0](msg, sessions, slack)

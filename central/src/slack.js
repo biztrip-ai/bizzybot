@@ -121,7 +121,17 @@ export function buildManifest({ appName, baseUrl }) {
     settings: {
       event_subscriptions: {
         request_url: `${baseUrl}/slack/events`,
-        bot_events: ['app_mention', 'message.im'],
+        // message.channels/groups/mpim let the bot follow up on plain thread
+        // replies (no re-@mention needed); the bridge only acts on replies in
+        // threads it's already engaged in. Scopes for these are in
+        // SLACK_BOT_SCOPES (channels:history / groups:history / mpim:history).
+        bot_events: [
+          'app_mention',
+          'message.im',
+          'message.channels',
+          'message.groups',
+          'message.mpim',
+        ],
       },
       interactivity: { is_enabled: false },
       org_deploy_enabled: false,
