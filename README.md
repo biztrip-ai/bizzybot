@@ -17,11 +17,11 @@ and app the Slack app, then run the agent-wrapper on your machine.
 
 Two self-contained apps:
 
-- **`central/`** — a vanilla Node web app + event dispatcher. Receives Slack
+- **`central-dispatch/`** — a vanilla Node web app + event dispatcher. Receives Slack
   events, persists them to a durable per-agent event log, and pushes them to a
   connected agent over a WebSocket. Multi-tenant across Slack workspaces.
-- **`bridge/`** — a Python program that runs in the agent workspace (laptop, VM,
-  container — set up by hand). Dials home to Central to register, receives events
+- **`agent-wrapper/`** — a Python program that runs in the agent workspace (laptop, VM,
+  container — set up by hand). Dials home to Central-Dispatch to register, receives events
   over the WebSocket, and drives Claude Code.
 
 The two talk over one small WebSocket protocol; the contract is documented in
@@ -29,22 +29,22 @@ The two talk over one small WebSocket protocol; the contract is documented in
 
 ## Quick start
 
-**Central** (Node 22+ — uses the built-in `node:sqlite`, no native build):
+**Central-Dispatch** (Node 22+ — uses the built-in `node:sqlite`, no native build):
 
 ```bash
-cd central
+cd central-dispatch
 npm install
 cp .env.example .env    # then edit
 npm start               # http://localhost:3000
 ```
 
-**Bridge** (Python 3.11+ with [`uv`](https://docs.astral.sh/uv/), plus `claude`
+**Agent-Wrapper** (Python 3.11+ with [`uv`](https://docs.astral.sh/uv/), plus `claude`
 and `gh` installed):
 
 ```bash
-cd bridge
+cd agent-wrapper
 cp .env.example .env    # set CENTRAL_URL + REGISTRATION_TOKEN
-uv run python bridge.py
+uv run python agent_wrapper.py
 ```
 
 ## License

@@ -6,9 +6,9 @@ node_modules/
 .certs/
 .DS_Store
 
-# bridge (python)
+# agent-wrapper (python)
 .venv/
 __pycache__/
-.bridge-state.json
-.bridge-config.json
+.agent-wrapper-state.json
+.agent-wrapper-config.json
 .sessions.json

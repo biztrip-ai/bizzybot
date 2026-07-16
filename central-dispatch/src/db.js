@@ -104,7 +104,7 @@ export async function init() {
         created_at BIGINT NOT NULL,
         UNIQUE (agent_id, seq)
       )`);
-    console.log(`[central] storage: Postgres (schema "${config.dbSchema}")`);
+    console.log(`[central-dispatch] storage: Postgres (schema "${config.dbSchema}")`);
   } else {
     sqlite.exec(`
       CREATE TABLE IF NOT EXISTS agents (
@@ -133,6 +133,6 @@ export async function init() {
     if (!cols.includes('last_seen_at')) {
       sqlite.exec(`ALTER TABLE agents ADD COLUMN last_seen_at INTEGER`);
     }
-    console.log(`[central] storage: SQLite (${config.dbPath})`);
+    console.log(`[central-dispatch] storage: SQLite (${config.dbPath})`);
   }
 }

@@ -31,6 +31,6 @@ attachWsHub(server);
 server.listen(config.port, () => {
   const scheme = config.tlsSelfSigned ? 'https' : 'http';
   console.log(
-    `[central] listening (${scheme}) on ${config.publicUrl} (port ${config.port})`,
+    `[central-dispatch] listening (${scheme}) on ${config.publicUrl} (port ${config.port})`,
   );
 });

@@ -1,16 +1,16 @@
-"""Claudebot OSS bridge.
+"""Claudebot OSS agent-wrapper.
 
 Runs in the agent workspace (a laptop, VM, or container — set up by hand). It:
-  1. dials home to Central with a registration token and pulls the Slack bot
-     token + WebSocket details (see central/docs, "Registration (dial-home)");
+  1. dials home to Central-Dispatch with a registration token and pulls the Slack bot
+     token + WebSocket details (see central-dispatch/docs, "Registration (dial-home)");
   2. runs a local preflight (Claude Code, gh, git);
-  3. opens a WebSocket to Central, replays anything it missed while offline
+  3. opens a WebSocket to Central-Dispatch, replays anything it missed while offline
      (via lastSeq), then processes live Slack events;
   4. drives one persistent Claude Code session per Slack thread and posts the
      replies straight back to Slack.
 
 No Ably, no cloud provisioning, no idle keep-alive. Uses your own local git/gh
-auth. Run:  uv run python bridge.py
+auth. Run:  uv run python agent_wrapper.py
 """
 
 from __future__ import annotations
@@ -40,13 +40,13 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("bridge")
+log = logging.getLogger("agent-wrapper")
 
 STATE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_PATH = os.path.join(STATE_DIR, ".bridge-state.json")
-CONFIG_PATH = os.path.join(STATE_DIR, ".bridge-config.json")
+STATE_PATH = os.path.join(STATE_DIR, ".agent-wrapper-state.json")
+CONFIG_PATH = os.path.join(STATE_DIR, ".agent-wrapper-config.json")
 
-# Default hosted Central. Override with CENTRAL_URL (env/.env) or the saved config.
+# Default hosted Central-Dispatch. Override with CENTRAL_URL (env/.env) or the saved config.
 DEFAULT_CENTRAL_URL = "https://claudebot-production-34ba.up.railway.app"
 
 SLACK_FORMATTING_PROMPT = """\
@@ -70,7 +70,7 @@ def _truthy(v: str | None) -> bool:
 
 
 def _insecure_tls_ctx(url: str):
-    """For a local Central over TLS (https/wss to localhost with a self-signed
+    """For a local Central-Dispatch over TLS (https/wss to localhost with a self-signed
     cert), return an SSL context that skips verification. Returns None for plain
     http/ws or real remote hosts, which keep normal verification.
 
@@ -95,7 +95,7 @@ def _parse_sources(raw: str) -> list[str]:
 
 
 class AuthError(Exception):
-    """Central rejected the registration token."""
+    """Central-Dispatch rejected the registration token."""
 
 
 def _load_local_config() -> dict[str, Any]:
@@ -114,7 +114,7 @@ def _save_local_config(cfg: dict[str, Any]) -> None:
         os.chmod(tmp, 0o600)  # holds the registration token (a secret)
         os.replace(tmp, CONFIG_PATH)
     except OSError as e:
-        log.warning("could not save bridge config: %s", e)
+        log.warning("could not save agent-wrapper config: %s", e)
 
 
 def _forget_token() -> None:
@@ -123,13 +123,13 @@ def _forget_token() -> None:
     _save_local_config(cfg)
 
 
-def resolve_central() -> str:
-    """CENTRAL_URL env > saved config > the default hosted Central."""
+def resolve_central_dispatch() -> str:
+    """CENTRAL_URL env > saved config > the default hosted Central-Dispatch."""
     saved = _load_local_config().get("central_url")
     return (os.getenv("CENTRAL_URL") or saved or DEFAULT_CENTRAL_URL).rstrip("/")
 
 
-def resolve_token(central: str) -> tuple[str, bool]:
+def resolve_token(central_dispatch: str) -> tuple[str, bool]:
     """Return (token, from_env). Reads REGISTRATION_TOKEN, then the saved config,
     then prompts interactively (caching the entered token for next time)."""
     env = os.getenv("REGISTRATION_TOKEN")
@@ -141,18 +141,18 @@ def resolve_token(central: str) -> tuple[str, bool]:
     if not sys.stdin.isatty():
         sys.exit(
             "No registration token found. Set REGISTRATION_TOKEN (env/.env), or run "
-            "the bridge interactively so it can prompt for one.\n"
-            f"Get a token: sign in at {central} and open your workspace dashboard."
+            "the agent-wrapper interactively so it can prompt for one.\n"
+            f"Get a token: sign in at {central_dispatch} and open your workspace dashboard."
         )
-    token = _prompt_for_token(central)
-    _save_local_config({"registration_token": token, "central_url": central})
+    token = _prompt_for_token(central_dispatch)
+    _save_local_config({"registration_token": token, "central_url": central_dispatch})
     return token, False
 
 
-def _prompt_for_token(central: str) -> str:
-    print("\n  Claudebot bridge — first-time setup")
-    print(f"  Central: {central}")
-    print(f"  Sign in at {central} and open your dashboard to copy your registration token.\n")
+def _prompt_for_token(central_dispatch: str) -> str:
+    print("\n  Claudebot agent-wrapper — first-time setup")
+    print(f"  Central-Dispatch: {central_dispatch}")
+    print(f"  Sign in at {central_dispatch} and open your dashboard to copy your registration token.\n")
     try:
         token = input("  Paste your registration token: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -162,11 +162,11 @@ def _prompt_for_token(central: str) -> str:
     return token
 
 
-async def register(http: aiohttp.ClientSession, central: str, token: str) -> dict[str, Any]:
+async def register(http: aiohttp.ClientSession, central_dispatch: str, token: str) -> dict[str, Any]:
     """Dial home: exchange the registration token for the Slack bot token and
     WebSocket connection details. Raises AuthError if the token is rejected."""
     async with http.post(
-        f"{central}/api/register", json={"token": token}, ssl=_insecure_tls_ctx(central)
+        f"{central_dispatch}/api/register", json={"token": token}, ssl=_insecure_tls_ctx(central_dispatch)
     ) as r:
         if r.status == 401:
             raise AuthError(await r.text())
@@ -226,7 +226,7 @@ def preflight() -> None:
     if problems:
         for p in problems:
             log.error("preflight: %s", p)
-        sys.exit("Preflight failed — fix the above and restart the bridge.")
+        sys.exit("Preflight failed — fix the above and restart the agent-wrapper.")
 
 
 # --- Session manager --------------------------------------------------------
@@ -451,7 +451,7 @@ META_COMMANDS: dict[str, tuple[Callable[..., Awaitable[None]], str]] = {
 
 
 async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWebClient) -> None:
-    """Handle one Slack event delivered by Central."""
+    """Handle one Slack event delivered by Central-Dispatch."""
     bot_user_id = await get_bot_user_id(slack)
     msg = normalize_slack_event(payload, bot_user_id)
     if msg is None:
@@ -516,7 +516,7 @@ def _save_last_seq(seq: int) -> None:
             json.dump({"last_seq": seq}, f)
         os.replace(tmp, STATE_PATH)
     except OSError as e:
-        log.warning("could not persist bridge state: %s", e)
+        log.warning("could not persist agent-wrapper state: %s", e)
 
 
 # --- WebSocket consumer -----------------------------------------------------
@@ -529,14 +529,14 @@ async def consume(
     on_event: Callable[[Any], Awaitable[None]],
     stop: asyncio.Event,
 ) -> None:
-    """Connect to Central's WebSocket and process events until `stop` is set.
+    """Connect to Central-Dispatch's WebSocket and process events until `stop` is set.
     Reconnects with backoff, resuming from the last contiguous seq we acked."""
     backoff = 1.0
     while not stop.is_set():
         url = f"{ws_url}?token={ws_token}&lastSeq={_load_last_seq()}"
         try:
             async with http.ws_connect(url, heartbeat=30, ssl=_insecure_tls_ctx(url)) as ws:
-                log.info("connected to Central (lastSeq=%d)", _load_last_seq())
+                log.info("connected to Central-Dispatch (lastSeq=%d)", _load_last_seq())
                 backoff = 1.0
                 cursor = Cursor(_load_last_seq())
                 send_lock = asyncio.Lock()
@@ -584,7 +584,7 @@ async def consume(
                 if inflight:
                     await asyncio.gather(*inflight, return_exceptions=True)
         except aiohttp.ClientError as e:
-            log.warning("Central connection error: %s", e)
+            log.warning("Central-Dispatch connection error: %s", e)
 
         if stop.is_set():
             return
@@ -597,18 +597,18 @@ async def consume(
 
 
 async def main() -> None:
-    central = resolve_central()
+    central_dispatch = resolve_central_dispatch()
     preflight()
 
     async with aiohttp.ClientSession() as http:
         reg = None
         while reg is None:
-            token, from_env = resolve_token(central)
+            token, from_env = resolve_token(central_dispatch)
             try:
-                reg = await register(http, central, token)
+                reg = await register(http, central_dispatch, token)
             except AuthError as e:
                 if from_env:
-                    sys.exit(f"REGISTRATION_TOKEN was rejected by Central: {e}")
+                    sys.exit(f"REGISTRATION_TOKEN was rejected by Central-Dispatch: {e}")
                 _forget_token()
                 if not sys.stdin.isatty():
                     sys.exit("Saved registration token was rejected; set a valid one and restart.")
@@ -617,11 +617,11 @@ async def main() -> None:
 
         slack_token = reg.get("slackBotToken") or os.getenv("SLACK_BOT_TOKEN") or ""
         if not slack_token:
-            log.warning("no Slack bot token from Central; replies to Slack will fail until one is configured")
+            log.warning("no Slack bot token from Central-Dispatch; replies to Slack will fail until one is configured")
         ws_info = reg.get("ws") or {}
         ws_url, ws_token = ws_info.get("url"), ws_info.get("token")
         if not ws_url or not ws_token:
-            sys.exit("Central did not return WebSocket details")
+            sys.exit("Central-Dispatch did not return WebSocket details")
 
         sessions = build_session_manager()
         slack = AsyncWebClient(token=slack_token)

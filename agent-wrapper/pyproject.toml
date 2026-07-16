@@ -1,7 +1,7 @@
 [project]
-name = "claudebot-bridge"
+name = "claudebot-agent-wrapper"
 version = "0.0.0"
-description = "Claudebot OSS bridge: dials home to Central, receives Slack events over a WebSocket, drives Claude Code."
+description = "Claudebot OSS agent-wrapper: dials home to Central-Dispatch, receives Slack events over a WebSocket, drives Claude Code."
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9.0",

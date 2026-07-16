@@ -305,7 +305,7 @@ wheels = [
 ]
 
 [[package]]
-name = "claudebot-bridge"
+name = "claudebot-agent-wrapper"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [

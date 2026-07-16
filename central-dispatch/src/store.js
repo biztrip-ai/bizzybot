@@ -29,7 +29,7 @@ export async function listAgents() {
   }));
 }
 
-// Record that we just saw the agent's bridge (connect/disconnect), for the
+// Record that we just saw the agent's agent-wrapper (connect/disconnect), for the
 // "last seen" indicator when it's offline.
 export async function touchAgentSeen(id) {
   await run(`UPDATE ${AGENTS} SET last_seen_at = ? WHERE id = ?`, [Date.now(), id]);

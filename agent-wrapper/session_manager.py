@@ -76,7 +76,7 @@ def load_cli_mcp_servers(cwd: Optional[str] = None) -> dict[str, dict]:
     return servers
 
 # Thread -> claude session_id map, persisted on the /workspaces volume (next to
-# this file) so it survives a codespace stop/start. Lets a restarted bridge
+# this file) so it survives a codespace stop/start. Lets a restarted agent-wrapper
 # RESUME each thread's prior conversation (full transcript) instead of starting
 # a blank one. (A rebuild wipes ~/.claude transcripts, so resume falls back to a
 # fresh session there — handled in Session._ensure_connected.)
@@ -357,7 +357,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
         # thread_key -> claude session_id, loaded from the /workspaces volume so a
-        # restarted bridge can resume each thread's conversation.
+        # restarted agent-wrapper can resume each thread's conversation.
         self._resume_ids: dict[str, str] = self._load_store()
         if self._resume_ids:
             log.info("loaded %d resumable session(s) from %s", len(self._resume_ids), _SESSION_STORE)
@@ -433,7 +433,7 @@ class SessionManager:
     def has_resume(self, key: str) -> bool:
         """True if we hold a persisted Claude session id for this thread — i.e.
         the bot was engaged in it before, even if the live session was dropped by
-        a restart. Lets a restarted bridge wake on a thread reply without needing
+        a restart. Lets a restarted agent-wrapper wake on a thread reply without needing
         a re-@mention."""
         return key in self._resume_ids
 

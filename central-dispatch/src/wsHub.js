@@ -16,7 +16,7 @@ export function onlineIds() {
 }
 
 // Threads we've already told "the agent is offline" during the current offline
-// episode, so a user firing several messages at a down bridge gets one notice,
+// episode, so a user firing several messages at a down agent-wrapper gets one notice,
 // not one per message. Reset for an agent when it reconnects.
 const offlineNotified = new Map(); // agentId -> Set(threadKey)
 

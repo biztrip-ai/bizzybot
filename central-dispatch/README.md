@@ -1,4 +1,4 @@
-# Central
+# Central-Dispatch
 
 Vanilla web app + event dispatcher. Express + `ws` + built-in `node:sqlite`.
 
@@ -21,7 +21,7 @@ npm start              # or: npm run dev  (node --watch)
 | POST   | `/slack/events`       | Slack Events API webhook.                                       |
 | POST   | `/api/admin/agents`   | Create an agent, get a registration token. Needs `x-admin-key`.|
 | GET    | `/api/admin/agents`   | List agents. Needs `x-admin-key`.                              |
-| POST   | `/api/register`       | Bridge dials home with its registration token.                 |
+| POST   | `/api/register`       | Agent-Wrapper dials home with its registration token.                 |
 | WS     | `/ws?token=<regtok>&lastSeq=<n>` | Agent event stream (replay + live push).            |
 
 ## Slack setup
@@ -29,8 +29,8 @@ npm start              # or: npm run dev  (node --watch)
 1. `GET /slack/manifest` → create a Slack app from the manifest.
 2. Copy the app's **Signing Secret**, **Client ID**, **Client Secret** into
    `.env` (`SLACK_SIGNING_SECRET`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`).
-3. Visit `/` → **Add to Slack** → authorize. Central shows you a **registration
-   token** and the exact bridge config to paste in.
+3. Visit `/` → **Add to Slack** → authorize. Central-Dispatch shows you a **registration
+   token** and the exact agent-wrapper config to paste in.
 
 ## How it works
 
@@ -43,7 +43,7 @@ npm start              # or: npm run dev  (node --watch)
    # -> { "id": "...", "name": "cosmo", "registrationToken": "..." }
    ```
 
-2. **Register** (what the bridge does with that token):
+2. **Register** (what the agent-wrapper does with that token):
 
    ```bash
    curl -s -X POST localhost:3000/api/register \
@@ -52,7 +52,7 @@ npm start              # or: npm run dev  (node --watch)
    # -> { "agentId": "...", "slackBotToken": "...", "ws": { "url": "...", "token": "..." } }
    ```
 
-3. **Connect the WebSocket** to `ws.url?token=<regtok>&lastSeq=<n>`. Central
+3. **Connect the WebSocket** to `ws.url?token=<regtok>&lastSeq=<n>`. Central-Dispatch
    replays events with `seq > lastSeq`, then live-pushes new ones. The client
    acks with `{ "type": "ack", "seq": <n> }`.
 

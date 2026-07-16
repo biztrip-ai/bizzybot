@@ -1,8 +1,8 @@
 """Slack output helpers: streaming renderer, attachment up/download, tool labels.
 
-Lifted from the original codespace bridge with no behavioural change — this is
+Lifted from the original codespace agent-wrapper with no behavioural change — this is
 the part that turns a Claude turn into nicely streamed Slack messages. Kept in
-its own module so bridge.py stays focused on transport (register + WebSocket).
+its own module so agent_wrapper.py stays focused on transport (register + WebSocket).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import aiohttp
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
 
-log = logging.getLogger("bridge.slack")
+log = logging.getLogger("agent-wrapper.slack")
 
 MAX_MSG_CHARS = 2800
 MIN_UPDATE_INTERVAL_S = 1.0

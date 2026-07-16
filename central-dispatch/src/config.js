@@ -16,7 +16,7 @@ export const config = {
   // local SQLite file.
   databaseUrl: process.env.DATABASE_URL || '',
   dbSchema: process.env.DB_SCHEMA || 'claudebot',
-  dbPath: process.env.DB_PATH || './central.db',
+  dbPath: process.env.DB_PATH || './central-dispatch.db',
   // Serve TLS locally with a self-signed cert so Slack's OAuth redirect to
   // https://localhost works. Leave OFF on Railway (the platform terminates TLS
   // and the app should listen plain HTTP behind it).
@@ -32,5 +32,5 @@ export const config = {
 };
 
 if (!process.env.SESSION_SECRET) {
-  console.warn('[central] SESSION_SECRET not set — dashboard sessions reset on restart');
+  console.warn('[central-dispatch] SESSION_SECRET not set — dashboard sessions reset on restart');
 }

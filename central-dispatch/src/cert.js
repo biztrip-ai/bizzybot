@@ -22,7 +22,7 @@ export function ensureSelfSignedCert(dir) {
       ],
       { stdio: 'ignore' },
     );
-    console.log(`[central] generated self-signed cert in ${dir}`);
+    console.log(`[central-dispatch] generated self-signed cert in ${dir}`);
   }
   return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
 }

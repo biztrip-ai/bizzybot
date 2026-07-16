@@ -1,6 +1,6 @@
 // Slack helpers: signature verification, OAuth code exchange, app manifest.
-// Adapted from the old Central, minus the multi-persona / Ably / wake machinery —
-// this OSS Central runs a single pre-built Slack app.
+// Adapted from the old Central-Dispatch, minus the multi-persona / Ably / wake machinery —
+// this OSS Central-Dispatch runs a single pre-built Slack app.
 import crypto from 'node:crypto';
 import { config } from './config.js';
 
@@ -101,9 +101,9 @@ export async function exchangeCode(code, redirectUri) {
   return res.json();
 }
 
-// --- Web API helpers (for Central-side notices) -----------------------------
-// Central normally never talks to Slack — the agent does. The one exception is
-// posting an "agent offline" notice when no bridge is connected to handle a
+// --- Web API helpers (for Central-Dispatch-side notices) -----------------------------
+// Central-Dispatch normally never talks to Slack — the agent does. The one exception is
+// posting an "agent offline" notice when no agent-wrapper is connected to handle a
 // message. These are deliberately tiny and best-effort.
 
 // Post a plain-text message to a channel/thread with the workspace bot token.
@@ -165,7 +165,7 @@ export async function botInThread({ token, channel, threadTs }) {
 
 // The Slack app manifest for this instance. Paste into "Create New App → From a
 // manifest" once, then fill SLACK_CLIENT_ID / SLACK_CLIENT_SECRET / signing
-// secret into Central's env. Socket Mode OFF — events arrive over the webhook.
+// secret into Central-Dispatch's env. Socket Mode OFF — events arrive over the webhook.
 export function buildManifest({ appName, baseUrl }) {
   return {
     display_information: { name: appName },
@@ -184,7 +184,7 @@ export function buildManifest({ appName, baseUrl }) {
       event_subscriptions: {
         request_url: `${baseUrl}/slack/events`,
         // message.channels/groups/mpim let the bot follow up on plain thread
-        // replies (no re-@mention needed); the bridge only acts on replies in
+        // replies (no re-@mention needed); the agent-wrapper only acts on replies in
         // threads it's already engaged in. Scopes for these are in
         // SLACK_BOT_SCOPES (channels:history / groups:history / mpim:history).
         bot_events: [

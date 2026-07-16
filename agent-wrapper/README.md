@@ -1,10 +1,10 @@
-# Bridge
+# Agent-Wrapper
 
 Runs in the agent workspace (laptop / VM / container, set up by hand). Dials home
-to Central, receives Slack events over a WebSocket, and drives Claude Code — one
+to Central-Dispatch, receives Slack events over a WebSocket, and drives Claude Code — one
 persistent session per Slack thread — posting replies back to Slack.
 
-Adapted from the original codespace bridge, minus Ably, cloud provisioning, idle
+Adapted from the original codespace agent-wrapper, minus Ably, cloud provisioning, idle
 keep-alive, and bot-token plumbing. It uses your own local `git`/`gh` auth.
 
 ## Requirements
@@ -16,24 +16,24 @@ keep-alive, and bot-token plumbing. It uses your own local `git`/`gh` auth.
 ## Run
 
 ```bash
-uv run python bridge.py
+uv run python agent_wrapper.py
 ```
 
 On first run it **prompts for your registration token** (get it by signing in at
-the Central dashboard) and caches it in `.bridge-config.json`, so later runs need
+the Central-Dispatch dashboard) and caches it in `.agent-wrapper-config.json`, so later runs need
 no arguments. `CENTRAL_URL` defaults to the hosted Claudebot — override it (env,
-`.env`, or the saved config) only to point at your own Central. You can also skip
+`.env`, or the saved config) only to point at your own Central-Dispatch. You can also skip
 the prompt by setting `REGISTRATION_TOKEN` in the environment or `.env`.
 
 On start it:
 
-1. **Registers** with Central (`POST /api/register`) using your registration
+1. **Registers** with Central-Dispatch (`POST /api/register`) using your registration
    token, and pulls the Slack bot token + WebSocket details. If a cached token is
    rejected, it re-prompts.
 2. Runs a **preflight** — checks Claude Code (fatal if missing), `gh` auth, and
    git identity (warnings).
 3. Opens the **WebSocket** and replays anything it missed (via the last acked
-   `seq` in `.bridge-state.json`), then handles live events.
+   `seq` in `.agent-wrapper-state.json`), then handles live events.
 
 ## Behaviour
 
@@ -41,12 +41,12 @@ On start it:
 - Streams replies into a single Slack message, edited in place.
 - Meta commands: `!stop` (interrupt the running turn), `!clear` (reset the
   thread's session), `!help`.
-- Events are acked by sequence; if the bridge is offline, Central holds events
+- Events are acked by sequence; if the agent-wrapper is offline, Central-Dispatch holds events
   and replays them on reconnect.
 
 ## State files (gitignored)
 
-- `.bridge-config.json` — cached registration token (+ Central URL), written on
+- `.agent-wrapper-config.json` — cached registration token (+ Central-Dispatch URL), written on
   first-run prompt. Holds a secret; kept `0600`.
-- `.bridge-state.json` — last acked event sequence.
+- `.agent-wrapper-state.json` — last acked event sequence.
 - `.sessions.json` — per-thread Claude session ids (for resume across restarts).
