@@ -281,6 +281,35 @@ async def get_bot_user_id(slack: AsyncWebClient) -> Optional[str]:
     return _bot_user_id
 
 
+# Threads we've confirmed the bot posted in, so repeat lookups are free. Only
+# "yes" results are cached (a "no" may become "yes" once the bot is @-mentioned).
+_bot_thread_cache: set[str] = set()
+
+
+async def bot_participates_in_thread(
+    slack: AsyncWebClient, channel: str, thread_ts: str, bot_user_id: Optional[str]
+) -> bool:
+    """True iff the bot has at least one message in this thread (via
+    conversations.replies). Last-resort signal for waking on a thread reply
+    when we have no local session record — e.g. after a restart that lost the
+    session store. Cached per (channel, thread_ts)."""
+    if not bot_user_id:
+        return False
+    key = f"{channel}:{thread_ts}"
+    if key in _bot_thread_cache:
+        return True
+    try:
+        resp = await slack.conversations_replies(channel=channel, ts=thread_ts, limit=200)
+    except Exception:  # noqa: BLE001 — never let a lookup failure kill the turn
+        log.warning("conversations.replies failed for %s", key, exc_info=True)
+        return False
+    for m in resp.get("messages", []):
+        if m.get("user") == bot_user_id:
+            _bot_thread_cache.add(key)
+            return True
+    return False
+
+
 def normalize_slack_event(
     event: dict[str, Any], bot_user_id: Optional[str] = None
 ) -> Optional[dict[str, Any]]:
@@ -428,11 +457,21 @@ async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWeb
     if msg is None:
         return  # not addressed to us / an echo — ignore (still acked)
     # A bare channel-thread reply only wakes the bot if it's already engaged in
-    # that thread (a live session). Otherwise any reply in any channel the bot
-    # sits in would trigger it. The app_mention path is what first creates the
-    # session, so this gate opens naturally after the bot is summoned once.
-    if msg.pop("needs_active_session", False) and not sessions.exists(msg["thread_key"]):
-        return
+    # that thread — otherwise any reply in any channel the bot sits in would
+    # trigger it. "Engaged" is, cheapest first: a live in-memory session, a
+    # persisted resume id (survives a restart), or — last resort — the bot
+    # actually appearing in the thread per conversations.replies.
+    if msg.pop("needs_active_session", False):
+        thread_key = msg["thread_key"]
+        engaged = (
+            sessions.exists(thread_key)
+            or sessions.has_resume(thread_key)
+            or await bot_participates_in_thread(
+                slack, msg["channel"], msg["reply_thread_ts"], bot_user_id
+            )
+        )
+        if not engaged:
+            return
     meta = META_COMMANDS.get((msg.get("text") or "").strip().lower())
     if meta:
         await meta[0](msg, sessions, slack)

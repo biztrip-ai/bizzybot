@@ -430,6 +430,13 @@ class SessionManager:
     def exists(self, key: str) -> bool:
         return key in self._sessions
 
+    def has_resume(self, key: str) -> bool:
+        """True if we hold a persisted Claude session id for this thread — i.e.
+        the bot was engaged in it before, even if the live session was dropped by
+        a restart. Lets a restarted bridge wake on a thread reply without needing
+        a re-@mention."""
+        return key in self._resume_ids
+
     def get(self, key: str) -> Optional[Session]:
         """Look up a thread's session without creating one, so callers that
         only want to act on an existing turn (e.g. !stop) don't spin up a
