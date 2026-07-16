@@ -1,6 +1,19 @@
-# Claudebot OSS
+# Claudebot
 
-An open-source, self-hosted version of Claudebot: a Slack-native AI teammate.
+Integrate a Claude Code agent into your Slack workspace.
+
+## Getting started
+
+The easiest way to run is to use our pre-created Slack apps and `eventmgr` app which is
+running on Railway. 
+
+Just visit:
+
+     https://claudebot-production-34ba.up.railway.app
+
+and app the Slack app, then run the agent-wrapper on your machine.
+
+## Running from source
 
 Two self-contained apps:
 
