@@ -101,6 +101,68 @@ export async function exchangeCode(code, redirectUri) {
   return res.json();
 }
 
+// --- Web API helpers (for Central-side notices) -----------------------------
+// Central normally never talks to Slack — the agent does. The one exception is
+// posting an "agent offline" notice when no bridge is connected to handle a
+// message. These are deliberately tiny and best-effort.
+
+// Post a plain-text message to a channel/thread with the workspace bot token.
+export async function postSlackMessage({ token, channel, threadTs, text }) {
+  const body = { channel, text };
+  if (threadTs) body.thread_ts = threadTs;
+  const res = await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+// The bot's own user id, cached per token (auth.test). Used to tell whether the
+// bot already participates in a thread before butting in with a notice.
+const _botUserIdCache = new Map();
+export async function botUserId(token) {
+  if (!token) return null;
+  if (_botUserIdCache.has(token)) return _botUserIdCache.get(token);
+  let id = null;
+  try {
+    const res = await fetch('https://slack.com/api/auth.test', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (data.ok) id = data.user_id || null;
+  } catch (e) {
+    console.warn('[slack] auth.test failed:', e.message);
+  }
+  if (id) _botUserIdCache.set(token, id);
+  return id;
+}
+
+// True iff the bot has posted at least one message in this thread. Lets us skip
+// unrelated threads when deciding whether an offline notice is warranted.
+export async function botInThread({ token, channel, threadTs }) {
+  const uid = await botUserId(token);
+  if (!uid) return false;
+  try {
+    const res = await fetch(
+      `https://slack.com/api/conversations.replies?channel=${encodeURIComponent(
+        channel,
+      )}&ts=${encodeURIComponent(threadTs)}&limit=200`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    const data = await res.json();
+    if (!data.ok) return false;
+    return (data.messages || []).some((m) => m.user === uid);
+  } catch (e) {
+    console.warn('[slack] conversations.replies failed:', e.message);
+    return false;
+  }
+}
+
 // The Slack app manifest for this instance. Paste into "Create New App → From a
 // manifest" once, then fill SLACK_CLIENT_ID / SLACK_CLIENT_SECRET / signing
 // secret into Central's env. Socket Mode OFF — events arrive over the webhook.

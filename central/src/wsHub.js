@@ -15,6 +15,24 @@ export function onlineIds() {
   return ids;
 }
 
+// Threads we've already told "the agent is offline" during the current offline
+// episode, so a user firing several messages at a down bridge gets one notice,
+// not one per message. Reset for an agent when it reconnects.
+const offlineNotified = new Map(); // agentId -> Set(threadKey)
+
+// Returns true if the caller should post an offline notice for this thread
+// (first time this episode), false if we've already notified.
+export function claimOfflineNotice(agentId, threadKey) {
+  let set = offlineNotified.get(agentId);
+  if (!set) {
+    set = new Set();
+    offlineNotified.set(agentId, set);
+  }
+  if (set.has(threadKey)) return false;
+  set.add(threadKey);
+  return true;
+}
+
 function send(ws, ev) {
   if (ws.readyState !== ws.OPEN) return;
   ws.send(
@@ -50,6 +68,7 @@ export function attachWsHub(server) {
     // nothing is dropped in the window between reading the log and going live.
     const conn = { ws, ready: false, queue: [] };
     connections.set(agent.id, conn);
+    offlineNotified.delete(agent.id); // fresh episode: allow notices again
     touchAgentSeen(agent.id).catch(() => {});
     console.log(`[ws] agent ${agent.id} connected (lastSeq=${lastSeq})`);
 

@@ -10,7 +10,7 @@ import {
   listAgents,
   appendEvent,
 } from './store.js';
-import { pushEvent, onlineIds } from './wsHub.js';
+import { pushEvent, onlineIds, claimOfflineNotice } from './wsHub.js';
 import { getSession, setSession, clearSession } from './session.js';
 import {
   SLACK_BOT_SCOPES,
@@ -20,6 +20,8 @@ import {
   oidcAuthorizeUrl,
   exchangeOidcCode,
   decodeIdToken,
+  postSlackMessage,
+  botInThread,
 } from './slack.js';
 
 export const router = express.Router();
@@ -234,9 +236,17 @@ router.post('/slack/events', async (req, res) => {
     // events, never real workspace traffic.)
     try {
       const targets = (await listAgents()).filter((a) => a.slack_team_id === teamId);
+      const online = onlineIds();
       for (const a of targets) {
         const ev = await appendEvent(a.id, 'slack_event', req.body.event);
         pushEvent(a.id, ev);
+      }
+      // If the message is addressed to the bot but no agent is connected to
+      // handle it (e.g. the bridge is restarting), post a one-off notice so the
+      // user isn't left staring at silence. The event is still logged and will
+      // be replayed to the agent when it reconnects.
+      if (targets.length && !targets.some((a) => online.has(a.id))) {
+        await notifyOfflineIfAddressed(teamId, targets, req.body.event);
       }
     } catch (e) {
       // Already acked to Slack; log and move on so it isn't an unhandled rejection.
@@ -244,3 +254,59 @@ router.post('/slack/events', async (req, res) => {
     }
   }
 });
+
+const _NOTIFY_IGNORED_SUBTYPES = new Set([
+  'bot_message',
+  'message_changed',
+  'message_deleted',
+  'channel_join',
+]);
+
+// Post an "agent offline" notice to Slack when a message clearly addressed to
+// the bot arrives with no agent online to handle it. Best-effort and deduped
+// per thread per offline episode (see claimOfflineNotice).
+async function notifyOfflineIfAddressed(teamId, targets, event) {
+  if (!event || typeof event !== 'object') return;
+  if (event.bot_id || _NOTIFY_IGNORED_SUBTYPES.has(event.subtype)) return;
+
+  const channel = event.channel;
+  const ts = event.ts;
+  if (!channel || !ts) return;
+  const threadTs = event.thread_ts || ts;
+
+  const agent = await getAgentByTeam(teamId);
+  const token = agent && agent.slack_bot_token;
+  if (!token) return; // can't post without the workspace bot token
+
+  // Decide whether this event is actually aimed at the bot.
+  const type = event.type;
+  const channelType = event.channel_type;
+  let addressed = false;
+  if (type === 'app_mention') {
+    addressed = true;
+  } else if (type === 'message' && channelType === 'im') {
+    addressed = true;
+  } else if (
+    type === 'message' &&
+    event.thread_ts &&
+    ['channel', 'group', 'mpim'].includes(channelType)
+  ) {
+    // A bare thread reply — only notify if the bot is actually in this thread,
+    // so we don't butt into unrelated conversations. Runs only while offline.
+    addressed = await botInThread({ token, channel, threadTs });
+  }
+  if (!addressed) return;
+
+  if (!claimOfflineNotice(targets[0].id, `${channel}:${threadTs}`)) return;
+
+  try {
+    await postSlackMessage({
+      token,
+      channel,
+      threadTs,
+      text: ':zzz: The agent is offline right now (it may be restarting). Your message is saved — it will be picked up once the agent reconnects.',
+    });
+  } catch (e) {
+    console.warn('[slack events] offline notice failed:', e.message);
+  }
+}
