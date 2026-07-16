@@ -18,7 +18,21 @@ export async function getAgentByToken(token) {
 }
 
 export async function listAgents() {
-  return all(`SELECT id, name, slack_team_id, registered_at FROM ${AGENTS}`);
+  const rows = await all(
+    `SELECT id, name, slack_team_id, registered_at, last_seen_at,
+            CASE WHEN slack_bot_token IS NOT NULL AND slack_bot_token <> '' THEN 1 ELSE 0 END AS slack_connected
+       FROM ${AGENTS} ORDER BY created_at`,
+  );
+  return rows.map((r) => ({
+    ...r,
+    slack_connected: Boolean(Number(r.slack_connected)),
+  }));
+}
+
+// Record that we just saw the agent's bridge (connect/disconnect), for the
+// "last seen" indicator when it's offline.
+export async function touchAgentSeen(id) {
+  await run(`UPDATE ${AGENTS} SET last_seen_at = ? WHERE id = ?`, [Date.now(), id]);
 }
 
 // The (first) agent bound to a Slack workspace, so re-authorizing the same

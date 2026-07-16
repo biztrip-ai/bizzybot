@@ -39,6 +39,53 @@ export function verifySlackSignature({ signingSecret, signature, timestamp, rawB
   return crypto.timingSafeEqual(a, b);
 }
 
+// --- Sign in with Slack (OIDC) ----------------------------------------------
+// User-level identity (not a bot install), used to authenticate a workspace
+// member for the dashboard. Same app credentials, different endpoints/scopes.
+
+export function oidcAuthorizeUrl(state, redirectUri) {
+  const u = new URL('https://slack.com/openid/connect/authorize');
+  u.searchParams.set('response_type', 'code');
+  u.searchParams.set('scope', 'openid email profile');
+  u.searchParams.set('client_id', config.slack.clientId);
+  u.searchParams.set('redirect_uri', redirectUri);
+  u.searchParams.set('state', state);
+  return u.toString();
+}
+
+export async function exchangeOidcCode(code, redirectUri) {
+  const res = await fetch('https://slack.com/api/openid.connect.token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: config.slack.clientId,
+      client_secret: config.slack.clientSecret,
+      code,
+      redirect_uri: redirectUri,
+    }),
+  });
+  return res.json();
+}
+
+// Decode the id_token JWT claims. The token is delivered server-to-server from
+// Slack's token endpoint over TLS in response to our client-secret-authenticated
+// request, so it's trusted without JWKS verification (optional hardening).
+export function decodeIdToken(idToken) {
+  try {
+    const [, payload] = idToken.split('.');
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    return {
+      teamId: claims['https://slack.com/team_id'] || null,
+      teamName: claims['https://slack.com/team_name'] || null,
+      userId: claims['https://slack.com/user_id'] || claims.sub || null,
+      name: claims.name || null,
+      email: claims.email || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Exchange an OAuth `code` for a bot token (oauth.v2.access).
 export async function exchangeCode(code, redirectUri) {
   const res = await fetch('https://slack.com/api/oauth.v2.access', {
@@ -64,8 +111,12 @@ export function buildManifest({ appName, baseUrl }) {
       bot_user: { display_name: appName, always_online: true },
     },
     oauth_config: {
-      redirect_urls: [`${baseUrl}/slack/oauth/callback`],
-      scopes: { bot: SLACK_BOT_SCOPES },
+      redirect_urls: [`${baseUrl}/slack/oauth/callback`, `${baseUrl}/auth/slack/callback`],
+      scopes: {
+        bot: SLACK_BOT_SCOPES,
+        // Sign in with Slack (dashboard auth).
+        user: ['openid', 'email', 'profile'],
+      },
     },
     settings: {
       event_subscriptions: {

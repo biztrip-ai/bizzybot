@@ -2,9 +2,18 @@
 // agent missed (seq > lastSeq), then live-push new ones. The agent acks by seq.
 import { WebSocketServer } from 'ws';
 import { MSG } from './protocol.js';
-import { getAgentByToken, eventsAfter, ackSeq } from './store.js';
+import { getAgentByToken, eventsAfter, ackSeq, touchAgentSeen } from './store.js';
 
 const connections = new Map(); // agentId -> { ws, ready, queue }
+
+// Agent ids with a live WebSocket right now (in-memory; single instance).
+export function onlineIds() {
+  const ids = new Set();
+  for (const [id, conn] of connections) {
+    if (conn.ws.readyState === conn.ws.OPEN) ids.add(id);
+  }
+  return ids;
+}
 
 function send(ws, ev) {
   if (ws.readyState !== ws.OPEN) return;
@@ -41,6 +50,7 @@ export function attachWsHub(server) {
     // nothing is dropped in the window between reading the log and going live.
     const conn = { ws, ready: false, queue: [] };
     connections.set(agent.id, conn);
+    touchAgentSeen(agent.id).catch(() => {});
     console.log(`[ws] agent ${agent.id} connected (lastSeq=${lastSeq})`);
 
     ws.on('message', (data) => {
@@ -57,6 +67,7 @@ export function attachWsHub(server) {
 
     ws.on('close', () => {
       if (connections.get(agent.id) === conn) connections.delete(agent.id);
+      touchAgentSeen(agent.id).catch(() => {});
       console.log(`[ws] agent ${agent.id} disconnected`);
     });
 

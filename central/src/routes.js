@@ -10,22 +10,27 @@ import {
   listAgents,
   appendEvent,
 } from './store.js';
-import { pushEvent } from './wsHub.js';
+import { pushEvent, onlineIds } from './wsHub.js';
+import { getSession, setSession, clearSession } from './session.js';
 import {
   SLACK_BOT_SCOPES,
   verifySlackSignature,
   exchangeCode,
   buildManifest,
+  oidcAuthorizeUrl,
+  exchangeOidcCode,
+  decodeIdToken,
 } from './slack.js';
 
 export const router = express.Router();
 
-function requireAdmin(req, res) {
-  if (!config.adminKey || req.get('x-admin-key') !== config.adminKey) {
-    res.status(401).json({ error: 'unauthorized' });
-    return false;
-  }
-  return true;
+function fmtAgo(ts) {
+  if (!ts) return 'never';
+  const s = Math.max(0, Math.floor((Date.now() - Number(ts)) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
 }
 
 function escapeHtml(s) {
@@ -35,38 +40,93 @@ function escapeHtml(s) {
 }
 
 // --- Landing ----------------------------------------------------------------
-router.get('/', (_req, res) => {
+const btn = (href, label, bg = '#4A154B') =>
+  `<a href="${href}" style="display:inline-block;background:${bg};color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;margin-right:8px">${label}</a>`;
+
+router.get('/', (req, res) => {
   const canInstall = Boolean(config.slack.clientId);
+  const sess = getSession(req);
   res.type('html').send(`<!doctype html><meta charset="utf-8">
 <title>Claudebot</title>
 <body style="font-family:system-ui;max-width:640px;margin:48px auto;padding:0 16px">
 <h1>Claudebot</h1>
 <p>A Slack-native AI teammate you self-host.</p>
 ${
-  canInstall
-    ? '<p><a href="/slack/install" style="display:inline-block;background:#4A154B;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none">Add to Slack</a></p>'
-    : '<p><em>Slack is not configured. Set SLACK_CLIENT_ID / SLACK_CLIENT_SECRET.</em></p>'
+  !canInstall
+    ? '<p><em>Slack is not configured. Set SLACK_CLIENT_ID / SLACK_CLIENT_SECRET.</em></p>'
+    : sess
+      ? `<p>${btn('/dashboard', 'Open dashboard')}<a href="/logout">sign out</a></p>`
+      : `<p>${btn('/slack/install', 'Add to Slack')}${btn('/login', 'Sign in with Slack', '#611f69')}</p>`
 }
 </body>`);
-});
-
-// --- Admin ------------------------------------------------------------------
-// Stand-in for the Slack sign-in flow: creates an agent and returns a
-// registration token for the operator to paste into the bridge.
-router.post('/api/admin/agents', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  const name = (req.body && req.body.name) || 'agent';
-  res.json(await createAgent(name));
-});
-
-router.get('/api/admin/agents', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  res.json(await listAgents());
 });
 
 // --- Slack OAuth install ("Add to Slack") -----------------------------------
 // CSRF states pending a callback (in-memory: single-process Central).
 const pendingStates = new Map(); // state -> expiresAt
+
+// --- Sign in with Slack (dashboard auth) ------------------------------------
+router.get('/login', (req, res) => {
+  if (!config.slack.clientId) return res.status(500).send('Slack not configured');
+  const state = crypto.randomBytes(16).toString('hex');
+  pendingStates.set(state, Date.now() + 10 * 60 * 1000);
+  res.redirect(oidcAuthorizeUrl(state, `${config.publicUrl}/auth/slack/callback`));
+});
+
+router.get('/auth/slack/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error) return res.status(400).send(`Slack error: ${escapeHtml(error)}`);
+  if (!code) return res.status(400).send('missing code');
+  const exp = pendingStates.get(state);
+  pendingStates.delete(state);
+  if (!exp || exp < Date.now()) return res.status(400).send('state mismatch or expired');
+
+  const data = await exchangeOidcCode(code, `${config.publicUrl}/auth/slack/callback`);
+  if (!data.ok || !data.id_token) {
+    return res.status(400).send(`sign-in failed: ${escapeHtml(data.error || 'unknown')}`);
+  }
+  const id = decodeIdToken(data.id_token);
+  if (!id || !id.teamId) return res.status(400).send('could not read Slack identity');
+
+  setSession(res, { teamId: id.teamId, userId: id.userId, name: id.name, teamName: id.teamName });
+  res.redirect('/dashboard');
+});
+
+router.get('/logout', (req, res) => {
+  clearSession(res);
+  res.redirect('/');
+});
+
+// Per-tenant dashboard: the signed-in workspace's own agent only.
+router.get('/dashboard', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.redirect('/login');
+
+  const agent = await getAgentByTeam(sess.teamId);
+  const workspace = agent?.name || sess.teamName || sess.teamId;
+  const online = agent ? onlineIds().has(agent.id) : false;
+
+  const body = agent
+    ? `<p>Slack: <b>✅ installed</b> · Bridge: <b>${
+        online ? '🟢 online' : `⚪️ offline · last seen ${fmtAgo(agent.last_seen_at)}`
+      }</b></p>
+       <h3>Connect your teammate</h3>
+       <p>On the machine where the teammate should run:</p>
+       <pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">CENTRAL_URL=${escapeHtml(config.publicUrl)}
+REGISTRATION_TOKEN=${escapeHtml(agent.registration_token)}</pre>
+       <p>Then run <code>uv run python bridge.py</code>. Keep the registration token secret.</p>`
+    : `<p>No teammate is installed in this workspace yet.</p>
+       <p>${btn('/slack/install', 'Add to Slack')}</p>`;
+
+  res.type('html').send(`<!doctype html><meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>Claudebot — ${escapeHtml(workspace)}</title>
+<body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.5">
+<p style="color:#666">Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></p>
+<h1>${escapeHtml(workspace)}</h1>
+${body}
+</body>`);
+});
 
 router.get('/slack/install', (req, res) => {
   if (!config.slack.clientId) {
@@ -113,20 +173,15 @@ router.get('/slack/oauth/callback', async (req, res) => {
     registrationToken = agent.registrationToken;
   }
 
-  res.type('html').send(`<!doctype html><meta charset="utf-8">
-<title>Claudebot — connected</title>
-<body style="font-family:system-ui;max-width:680px;margin:48px auto;padding:0 16px;line-height:1.5">
-<h1>✅ Connected to ${escapeHtml(teamName)}</h1>
-<p>Now start your teammate on the machine where it should run (laptop, VM, container):</p>
-<ol>
-<li>Configure the bridge:
-<pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">CENTRAL_URL=${escapeHtml(config.publicUrl)}
-REGISTRATION_TOKEN=${escapeHtml(registrationToken)}</pre></li>
-<li>Run it: <pre style="background:#f4f4f4;padding:12px;border-radius:6px">uv run python bridge.py</pre></li>
-</ol>
-<p>Keep the registration token secret — anyone with it can connect a teammate to your workspace.
-Once the bridge is online, <b>@mention the bot</b> in Slack or send it a DM.</p>
-</body>`);
+  // Log the installer in and land them on the dashboard (which shows the token
+  // + live status for this workspace).
+  setSession(res, {
+    teamId,
+    userId: data.authed_user?.id ?? null,
+    name: null,
+    teamName,
+  });
+  res.redirect('/dashboard');
 });
 
 // --- Slack app manifest -----------------------------------------------------

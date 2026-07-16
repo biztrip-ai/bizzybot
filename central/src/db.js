@@ -89,8 +89,11 @@ export async function init() {
         created_at         BIGINT NOT NULL,
         registered_at      BIGINT,
         last_acked_seq     BIGINT NOT NULL DEFAULT 0,
-        event_seq          BIGINT NOT NULL DEFAULT 0
+        event_seq          BIGINT NOT NULL DEFAULT 0,
+        last_seen_at       BIGINT
       )`);
+    // Idempotent migrations for tables that may predate a column.
+    await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS last_seen_at BIGINT`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS ${EVENTS} (
         id         BIGSERIAL PRIMARY KEY,
@@ -113,7 +116,8 @@ export async function init() {
         created_at         INTEGER NOT NULL,
         registered_at      INTEGER,
         last_acked_seq     INTEGER NOT NULL DEFAULT 0,
-        event_seq          INTEGER NOT NULL DEFAULT 0
+        event_seq          INTEGER NOT NULL DEFAULT 0,
+        last_seen_at       INTEGER
       );
       CREATE TABLE IF NOT EXISTS events (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +128,11 @@ export async function init() {
         created_at INTEGER NOT NULL,
         UNIQUE (agent_id, seq)
       );`);
+    // Idempotent migration for older DBs (SQLite has no ADD COLUMN IF NOT EXISTS).
+    const cols = sqlite.prepare(`PRAGMA table_info(agents)`).all().map((c) => c.name);
+    if (!cols.includes('last_seen_at')) {
+      sqlite.exec(`ALTER TABLE agents ADD COLUMN last_seen_at INTEGER`);
+    }
     console.log(`[central] storage: SQLite (${config.dbPath})`);
   }
 }
