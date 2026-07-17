@@ -88,6 +88,7 @@ table today — agents are keyed by team+app):
 | `mailgun_domain`  | TEXT | receiving + sending domain |
 | `mailgun_api_key` | TEXT | account-wide key (receive via Events API, send replies) |
 | `mailgun_base_url`| TEXT | optional; `https://api.eu.mailgun.net` for EU |
+| `sender_allow`    | TEXT | workspace default sender allow-list (comma-separated domains) |
 
 **Add to `agents`** (idempotent migration, matching the existing
 `ADD COLUMN IF NOT EXISTS` / PRAGMA pattern in `db.js`):
@@ -197,8 +198,9 @@ standing send capability. Not needed for the auto-reply.
 
 - **Sender allow-list is the trust boundary.** Inbound mail is attacker-
   controlled and is fed to Claude in `bypassPermissions`. Only fire for senders
-  on the agent's allow-list (or the global default). An agent with no allow-list
-  configured defaults to **closed**, not open.
+  on the allow-list, resolved per-agent override → workspace default (dashboard)
+  → `EMAIL_SENDER_DOMAIN` env (last resort). If none names a domain the agent is
+  **closed**, not open.
 - **The key never enters Claude's environment.** Because the email body can
   carry prompt-injection, Claude composes but does not send; the agent-wrapper
   performs the Mailgun call with the payload's creds, held in memory and never

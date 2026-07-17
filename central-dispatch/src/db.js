@@ -10,6 +10,9 @@ const usePg = Boolean(config.databaseUrl);
 // other apps sharing the database; SQLite uses plain names.
 export const AGENTS = usePg ? `${config.dbSchema}.agents` : 'agents';
 export const EVENTS = usePg ? `${config.dbSchema}.events` : 'events';
+export const WORKSPACE_SETTINGS = usePg
+  ? `${config.dbSchema}.workspace_settings`
+  : 'workspace_settings';
 
 let pool = null;
 let sqlite = null;
@@ -95,6 +98,17 @@ export async function init() {
     // Idempotent migrations for tables that may predate a column.
     await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS last_seen_at BIGINT`);
     await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS slack_app_id TEXT`);
+    // Inbound-email columns (see docs/EMAIL.md).
+    await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS email_local_part TEXT`);
+    await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS email_channel TEXT`);
+    await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS email_sender_allow TEXT`);
+    // A local-part must be unique within a workspace (same local-part on two
+    // different workspace domains is fine). Partial: only enforced when set.
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS agents_team_email_local_part
+         ON ${AGENTS} (slack_team_id, email_local_part)
+       WHERE email_local_part IS NOT NULL`,
+    );
     await pool.query(`
       CREATE TABLE IF NOT EXISTS ${EVENTS} (
         id         BIGSERIAL PRIMARY KEY,
@@ -105,6 +119,18 @@ export async function init() {
         created_at BIGINT NOT NULL,
         UNIQUE (agent_id, seq)
       )`);
+    // Per-workspace Mailgun config (domain + account-wide key) + the workspace's
+    // default sender allow-list, set on the dashboard.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${WORKSPACE_SETTINGS} (
+        team_id          TEXT PRIMARY KEY,
+        mailgun_domain   TEXT,
+        mailgun_api_key  TEXT,
+        mailgun_base_url TEXT,
+        sender_allow     TEXT,
+        updated_at       BIGINT NOT NULL
+      )`);
+    await pool.query(`ALTER TABLE ${WORKSPACE_SETTINGS} ADD COLUMN IF NOT EXISTS sender_allow TEXT`);
     console.log(`[central-dispatch] storage: Postgres (schema "${config.dbSchema}")`);
   } else {
     sqlite.exec(`
@@ -129,6 +155,14 @@ export async function init() {
         payload    TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         UNIQUE (agent_id, seq)
+      );
+      CREATE TABLE IF NOT EXISTS workspace_settings (
+        team_id          TEXT PRIMARY KEY,
+        mailgun_domain   TEXT,
+        mailgun_api_key  TEXT,
+        mailgun_base_url TEXT,
+        sender_allow     TEXT,
+        updated_at       INTEGER NOT NULL
       );`);
     // Idempotent migration for older DBs (SQLite has no ADD COLUMN IF NOT EXISTS).
     const cols = sqlite.prepare(`PRAGMA table_info(agents)`).all().map((c) => c.name);
@@ -137,6 +171,25 @@ export async function init() {
     }
     if (!cols.includes('slack_app_id')) {
       sqlite.exec(`ALTER TABLE agents ADD COLUMN slack_app_id TEXT`);
+    }
+    // Inbound-email columns (see docs/EMAIL.md).
+    if (!cols.includes('email_local_part')) {
+      sqlite.exec(`ALTER TABLE agents ADD COLUMN email_local_part TEXT`);
+    }
+    if (!cols.includes('email_channel')) {
+      sqlite.exec(`ALTER TABLE agents ADD COLUMN email_channel TEXT`);
+    }
+    if (!cols.includes('email_sender_allow')) {
+      sqlite.exec(`ALTER TABLE agents ADD COLUMN email_sender_allow TEXT`);
+    }
+    sqlite.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS agents_team_email_local_part
+         ON agents (slack_team_id, email_local_part)
+       WHERE email_local_part IS NOT NULL`,
+    );
+    const wsCols = sqlite.prepare(`PRAGMA table_info(workspace_settings)`).all().map((c) => c.name);
+    if (!wsCols.includes('sender_allow')) {
+      sqlite.exec(`ALTER TABLE workspace_settings ADD COLUMN sender_allow TEXT`);
     }
     console.log(`[central-dispatch] storage: SQLite (${config.dbPath})`);
   }

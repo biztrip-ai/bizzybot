@@ -12,6 +12,9 @@ import {
   markRegistered,
   listAgents,
   appendEvent,
+  getWorkspaceSettings,
+  setWorkspaceSettings,
+  setAgentEmail,
 } from './store.js';
 import { pushEvent, onlineIds, claimOfflineNotice } from './wsHub.js';
 import { getSession, setSession, clearSession } from './session.js';
@@ -128,6 +131,8 @@ router.get('/dashboard', async (req, res) => {
 
   const workspace = sess.teamName || sess.teamId;
   const agents = await listAgentsByTeam(sess.teamId);
+  const ws = await getWorkspaceSettings(sess.teamId);
+  const emailDomain = ws?.mailgun_domain || '';
   const online = onlineIds();
   const apps = config.slack.apps;
   const multi = apps.length > 1;
@@ -146,6 +151,33 @@ router.get('/dashboard', async (req, res) => {
 
   const installUrl = (app) =>
     app.appId ? `/slack/install?app=${encodeURIComponent(app.appId)}` : '/slack/install';
+
+  const fieldStyle =
+    'font-family:ui-monospace,SFMono-Regular,monospace;font-size:13px;padding:6px 8px;border:1px solid #ccc;border-radius:6px';
+  const saveBtn =
+    'padding:6px 12px;border:0;border-radius:6px;background:#4A154B;color:#fff;cursor:pointer';
+
+  // Per-agent inbound-email settings (see docs/EMAIL.md). Only meaningful once
+  // the workspace has a Mailgun domain configured (the section below).
+  const emailForm = (agent) => `
+      <form method="post" action="/dashboard/agent-email"
+            style="margin-top:12px;border-top:1px solid #eee;padding-top:12px;font-size:13px">
+        <input type="hidden" name="agentId" value="${escapeHtml(agent.id)}">
+        <p style="margin:0 0 6px"><b>📧 Email</b>${
+          emailDomain ? '' : ' <span style="color:#999">— set the workspace Mailgun domain below first</span>'
+        }</p>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input name="localPart" value="${escapeHtml(agent.email_local_part || '')}"
+                 placeholder="bizzy" style="${fieldStyle};width:110px">
+          <span style="color:#666">@${escapeHtml(emailDomain || '…')}</span>
+          <input name="channel" value="${escapeHtml(agent.email_channel || '')}"
+                 placeholder="channel id C0123…" style="${fieldStyle};width:150px">
+          <input name="senderAllow" value="${escapeHtml(agent.email_sender_allow || '')}"
+                 placeholder="sender override (optional)" title="comma-separated; blank = the workspace default above"
+                 style="${fieldStyle};width:190px">
+          <button type="submit" style="${saveBtn}">Save</button>
+        </div>
+      </form>`;
 
   const agentCard = (app, agent, i) => {
     const label = escapeHtml(agent?.name || app.name || 'Agent');
@@ -171,6 +203,7 @@ router.get('/dashboard', async (req, res) => {
         <button type="button" onclick="copyTok('${tokId}',this)"
           style="padding:8px 14px;border:0;border-radius:6px;background:#4A154B;color:#fff;cursor:pointer;white-space:nowrap">Copy</button>
       </div>
+      ${emailForm(agent)}
     </div>`;
   };
 
@@ -183,8 +216,25 @@ router.get('/dashboard', async (req, res) => {
     .map((a, i) => agentCard({ name: a.name, appId: a.slack_app_id }, a, apps.length + i))
     .join('');
 
+  const errBanner =
+    req.query.err === 'emaildup'
+      ? `<p style="background:#fdeaea;color:#a11;border:1px solid #f3caca;border-radius:6px;padding:8px 12px">That email address is already used by another agent in this workspace.</p>`
+      : '';
+
+  const mailgunSection = `
+<h3>Email (Mailgun)</h3>
+<p style="color:#666;font-size:14px">Configure your workspace's Mailgun account so agents can receive and reply to email. The key is used to poll inbound mail and (transiently) to send replies. Requires a Mailgun catch-all route that <code>store()</code>s inbound mail.</p>
+<form method="post" action="/dashboard/mailgun" style="${cardStyle};display:flex;flex-direction:column;gap:8px;max-width:520px;font-size:13px">
+  <label>Domain<br><input name="domain" value="${escapeHtml(ws?.mailgun_domain || '')}" placeholder="mail.yourco.com" style="${fieldStyle};width:100%"></label>
+  <label>API key<br><input name="apiKey" type="password" placeholder="${
+    ws?.mailgun_api_key ? '•••••• set — leave blank to keep' : 'key-…'
+  }" style="${fieldStyle};width:100%"></label>
+  <label>Base URL <span style="color:#999">(optional; EU: https://api.eu.mailgun.net)</span><br><input name="baseUrl" value="${escapeHtml(ws?.mailgun_base_url || '')}" placeholder="https://api.mailgun.net" style="${fieldStyle};width:100%"></label>
+  <label>Allowed sender domains <span style="color:#999">(comma-separated; the trust boundary — mail from other domains is ignored)</span><br><input name="senderAllow" value="${escapeHtml(ws?.sender_allow || '')}" placeholder="yourco.com, partner.com" style="${fieldStyle};width:100%"></label>
+  <div><button type="submit" style="${saveBtn}">Save Mailgun settings</button></div>
+</form>`;
+
   res.type('html').send(`<!doctype html><meta charset="utf-8">
-<meta http-equiv="refresh" content="10">
 <title>Bizzybot — ${escapeHtml(workspace)}</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.5">
 <p style="color:#666;display:flex;gap:8px;align-items:baseline">
@@ -192,10 +242,12 @@ router.get('/dashboard', async (req, res) => {
   <a href="${REPO_URL}" target="_blank" rel="noopener" style="margin-left:auto;color:#4A154B;text-decoration:none;white-space:nowrap">GitHub ↗</a>
 </p>
 <h1>${escapeHtml(workspace)}</h1>
+${errBanner}
 <p style="color:#666">${
     multi ? `Run up to ${apps.length} agents in this workspace — one per Slack app.` : ''
   }</p>
 ${cards}${orphanCards}
+${mailgunSection}
 <h3>Install an agent</h3>
 <p>On the machine where an agent should run, install the wrapper once:</p>
 <pre style="${preStyle}">uv tool install "git+${REPO_URL}.git#subdirectory=agent-wrapper"</pre>
@@ -214,6 +266,40 @@ function copyTok(id,btn){
 }
 </script>
 </body>`);
+});
+
+// Save the workspace's Mailgun config. A blank API key keeps the stored one
+// (so re-saving domain/base-url doesn't require re-entering the secret).
+router.post('/dashboard/mailgun', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.redirect('/login');
+  const { domain, baseUrl, senderAllow } = req.body || {};
+  let apiKey = (req.body?.apiKey || '').trim();
+  if (!apiKey) {
+    const cur = await getWorkspaceSettings(sess.teamId);
+    apiKey = cur?.mailgun_api_key || '';
+  }
+  await setWorkspaceSettings(sess.teamId, { domain, apiKey, baseUrl, senderAllow });
+  res.redirect('/dashboard');
+});
+
+// Save an agent's inbound-email routing. Verifies the agent belongs to the
+// signed-in workspace before writing (the agentId comes from the form).
+router.post('/dashboard/agent-email', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.redirect('/login');
+  const { agentId, channel, senderAllow } = req.body || {};
+  const localPart = (req.body?.localPart || '').trim().toLowerCase().replace(/@.*$/, '');
+  const agent = agentId ? await getAgentById(agentId) : null;
+  if (!agent || agent.slack_team_id !== sess.teamId) return res.status(403).send('forbidden');
+  try {
+    await setAgentEmail(agentId, { localPart, channel, senderAllow });
+  } catch (e) {
+    // Most likely the per-workspace unique local-part index.
+    console.warn('[dashboard] setAgentEmail failed:', e.message);
+    return res.redirect('/dashboard?err=emaildup');
+  }
+  res.redirect('/dashboard');
 });
 
 router.get('/slack/install', (req, res) => {

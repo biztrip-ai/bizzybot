@@ -1,7 +1,7 @@
 // Plain data-access functions over the db layer. Async so the same code works on
 // SQLite (sync driver, resolves immediately) and Postgres (async driver).
 import { randomUUID, randomBytes } from 'node:crypto';
-import { get, all, run, tx, isPg, AGENTS, EVENTS } from './db.js';
+import { get, all, run, tx, isPg, AGENTS, EVENTS, WORKSPACE_SETTINGS } from './db.js';
 
 export async function createAgent(name) {
   const id = randomUUID();
@@ -37,9 +37,73 @@ export async function getAgentById(id) {
 // per-tenant dashboard. Includes the registration token so each card can show it.
 export async function listAgentsByTeam(teamId) {
   return all(
-    `SELECT id, name, slack_app_id, registration_token, last_seen_at
+    `SELECT id, name, slack_app_id, registration_token, last_seen_at,
+            email_local_part, email_channel, email_sender_allow
        FROM ${AGENTS} WHERE slack_team_id = ? ORDER BY created_at`,
     [teamId],
+  );
+}
+
+// --- Inbound email (see docs/EMAIL.md) --------------------------------------
+
+const orNull = (v) => {
+  const s = (v ?? '').toString().trim();
+  return s === '' ? null : s;
+};
+
+// The agent in a workspace that owns a given inbound local-part (the recipient
+// mailbox of an email), used by the poller to route mail to an agent.
+export async function getAgentByEmailLocalPart(teamId, localPart) {
+  if (!teamId || !localPart) return null;
+  return get(
+    `SELECT * FROM ${AGENTS} WHERE slack_team_id = ? AND email_local_part = ? LIMIT 1`,
+    [teamId, localPart],
+  );
+}
+
+// Set (or clear) an agent's email routing config. Empty values become NULL so a
+// cleared local-part/channel disables email for that agent.
+export async function setAgentEmail(id, { localPart, channel, senderAllow } = {}) {
+  await run(
+    `UPDATE ${AGENTS}
+        SET email_local_part = ?, email_channel = ?, email_sender_allow = ?
+      WHERE id = ?`,
+    [orNull(localPart), orNull(channel), orNull(senderAllow), id],
+  );
+}
+
+export async function getWorkspaceSettings(teamId) {
+  if (!teamId) return null;
+  return get(`SELECT * FROM ${WORKSPACE_SETTINGS} WHERE team_id = ?`, [teamId]);
+}
+
+// Upsert a workspace's Mailgun config + default sender allow-list. Empty values
+// become NULL.
+export async function setWorkspaceSettings(
+  teamId,
+  { domain, apiKey, baseUrl, senderAllow } = {},
+) {
+  await run(
+    `INSERT INTO ${WORKSPACE_SETTINGS}
+       (team_id, mailgun_domain, mailgun_api_key, mailgun_base_url, sender_allow, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (team_id) DO UPDATE SET
+       mailgun_domain   = excluded.mailgun_domain,
+       mailgun_api_key  = excluded.mailgun_api_key,
+       mailgun_base_url = excluded.mailgun_base_url,
+       sender_allow     = excluded.sender_allow,
+       updated_at       = excluded.updated_at`,
+    [teamId, orNull(domain), orNull(apiKey), orNull(baseUrl), orNull(senderAllow), Date.now()],
+  );
+}
+
+// Every workspace that has Mailgun fully configured — the poller's work list.
+export async function listConfiguredWorkspaces() {
+  return all(
+    `SELECT team_id, mailgun_domain, mailgun_api_key, mailgun_base_url, sender_allow
+       FROM ${WORKSPACE_SETTINGS}
+      WHERE mailgun_domain  IS NOT NULL AND mailgun_domain  <> ''
+        AND mailgun_api_key IS NOT NULL AND mailgun_api_key <> ''`,
   );
 }
 
