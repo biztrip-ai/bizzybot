@@ -55,7 +55,13 @@ class SlackRenderer:
     the agent's text accumulates, rolling over to a new message before Slack's
     length limit."""
 
-    def __init__(self, client: AsyncWebClient, channel: str, thread_ts: Optional[str]):
+    def __init__(
+        self,
+        client: AsyncWebClient,
+        channel: str,
+        thread_ts: Optional[str],
+        queued: bool = False,
+    ):
         self._client = client
         self._channel = channel
         self._thread_ts = thread_ts
@@ -63,10 +69,30 @@ class SlackRenderer:
         self._body = ""
         self._last_flushed_len = 0
         self._last_flush_at = 0.0
-        self._placeholder = f"_{random.choice(THINKING_PHRASES)}_"
+        # If another turn on this thread is still running, our turn waits behind
+        # it — show that instead of a frozen "thinking…" line. Swapped for a
+        # normal phrase by mark_active() once our turn actually starts.
+        self._queued = queued
+        self._placeholder = (
+            "_⏳ queued — finishing an earlier request in this thread first…_"
+            if queued
+            else f"_{random.choice(THINKING_PHRASES)}_"
+        )
         # Latest tool activity ("📄 Read foo.py"), shown while the agent works so
         # a long tool run isn't dead air. Cleared when real text resumes.
         self._status = ""
+
+    async def mark_active(self) -> None:
+        """The turn just started (we hold the session lock now). If we're still
+        showing the queued placeholder and nothing real has streamed yet, swap
+        it for a normal thinking phrase so the message doesn't read as queued."""
+        if not self._queued:
+            return
+        self._queued = False
+        if self._body or self._status:
+            return
+        self._placeholder = f"_{random.choice(THINKING_PHRASES)}_"
+        await self._push(force=True)
 
     async def open(self) -> None:
         resp = await self._client.chat_postMessage(

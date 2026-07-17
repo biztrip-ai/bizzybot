@@ -255,6 +255,11 @@ def build_session_manager() -> SessionManager:
         # Screenshots/images the agent Reads back arrive as one big base64 JSON
         # message; the SDK's 1MB default rejects them. 64MB by default.
         max_buffer_size=int(os.getenv("CLAUDE_MAX_BUFFER_SIZE", str(64 * 1024 * 1024))),
+        # Evict sessions idle longer than this (default 4h) to free their claude
+        # subprocesses; 0 disables. The resume id is kept so the next message
+        # resumes the conversation.
+        idle_timeout_s=float(os.getenv("SESSION_IDLE_TIMEOUT_S", str(4 * 3600))),
+        reap_interval_s=float(os.getenv("SESSION_REAP_INTERVAL_S", "300")),
     )
 
 
@@ -393,13 +398,17 @@ async def handle_user_message(
             )
 
     log.info("message thread=%s channel=%s len=%d files=%d", thread_key, channel, len(text), len(files))
-    renderer = SlackRenderer(slack, channel, reply_ts)
-    await renderer.open()
     session = await sessions.get_or_create(thread_key)
+    # If a turn on this thread is already running, ours will queue behind it on
+    # the session lock — tell the user rather than showing a frozen "thinking…".
+    renderer = SlackRenderer(slack, channel, reply_ts, queued=session.is_busy)
+    await renderer.open()
     full_text: list[str] = []
     try:
         async for chunk in session.send(text):
-            if chunk.kind == "text":
+            if chunk.kind == "turn_start":
+                await renderer.mark_active()
+            elif chunk.kind == "text":
                 full_text.append(chunk.text)
                 await renderer.append(ATTACH_RE.sub("", chunk.text))
             elif chunk.kind == "tool_use":
@@ -626,6 +635,7 @@ async def main() -> None:
             sys.exit("Central-Dispatch did not return WebSocket details")
 
         sessions = build_session_manager()
+        sessions.start_reaper()
         slack = AsyncWebClient(token=slack_token)
 
         stop = asyncio.Event()

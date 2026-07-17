@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import AsyncIterator, Callable, Optional
 
@@ -100,6 +101,8 @@ class Chunk:
     """One piece of output produced during a turn.
 
     `kind` is one of:
+      - "turn_start"  — the turn acquired the session lock and is now running
+                        (no payload); lets a queued placeholder swap to active.
       - "text"        — assistant text block, suitable for streaming to Slack.
       - "tool_use"    — formatted tool invocation (name + full args) for the transcript.
       - "tool_result" — formatted tool result (id, is_error, full content) for the transcript.
@@ -138,11 +141,23 @@ class Session:
         self._primer_pending = resumed
         self._on_session_id = on_session_id
         self.session_id: Optional[str] = getattr(options, "resume", None)
+        # Monotonic timestamp of the last turn activity — used by the reaper to
+        # evict sessions idle longer than the TTL.
+        self._last_used_at = time.monotonic()
 
     @property
     def next_turn_number(self) -> int:
         """The 1-based turn number that the next call to `send()` will use."""
         return self._turn + 1
+
+    @property
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self._last_used_at
+
+    @property
+    def is_busy(self) -> bool:
+        """True iff a turn is currently in flight (the per-session lock is held)."""
+        return self._lock.locked()
 
     def _capture_session_id(self, sid: Optional[str]) -> None:
         if sid and sid != self.session_id:
@@ -174,6 +189,10 @@ class Session:
 
     async def send(self, prompt: str) -> AsyncIterator[Chunk]:
         async with self._lock:
+            self._last_used_at = time.monotonic()
+            # Signal that the turn has actually started (lock held). A caller
+            # that showed a "queued" placeholder swaps it for "thinking…" here.
+            yield Chunk("turn_start", "")
             await self._ensure_connected()
             self._turn += 1
             turn = self._turn
@@ -278,6 +297,7 @@ class Session:
                         parts.append(f"cost=${cost}")
                     if usage is not None:
                         parts.append(f"usage={usage}")
+                    self._last_used_at = time.monotonic()
                     yield Chunk("result", " ".join(parts))
                     return
 
@@ -342,6 +362,8 @@ class SessionManager:
         system_prompt_append: Optional[str] = None,
         mcp_servers: Optional[dict[str, dict]] = None,
         max_buffer_size: Optional[int] = None,
+        idle_timeout_s: Optional[float] = None,
+        reap_interval_s: float = 300.0,
     ):
         self._cwd = cwd
         self._permission_mode = permission_mode
@@ -350,6 +372,13 @@ class SessionManager:
         self._extra_args = extra_args or {}
         self._mcp_servers = mcp_servers or {}
         self._system_prompt_append = system_prompt_append
+        # Each session pins a ~80-130MB claude subprocess. If set, a background
+        # reaper closes sessions idle longer than this many seconds. The
+        # persisted resume id is kept, so the next message in a reaped thread
+        # transparently resumes the same conversation.
+        self._idle_timeout_s = idle_timeout_s
+        self._reap_interval_s = reap_interval_s
+        self._reaper_task: Optional[asyncio.Task] = None
         # The SDK reads the CLI's stdout as newline-delimited JSON and rejects any
         # single message larger than this. Image tool_results (e.g. a screenshot
         # the agent Reads back) base64-encode well past the SDK's 1MB default, so
@@ -461,6 +490,58 @@ class SessionManager:
         return True
 
     async def close_all(self) -> None:
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except asyncio.CancelledError:
+                pass
+            self._reaper_task = None
         for session in list(self._sessions.values()):
             await session.close()
         self._sessions.clear()
+
+    def start_reaper(self) -> None:
+        """Start the background idle-session reaper if a positive
+        `idle_timeout_s` was configured. Idempotent; call from a running loop."""
+        if not self._idle_timeout_s or self._idle_timeout_s <= 0:
+            return
+        if self._reaper_task is not None and not self._reaper_task.done():
+            return
+        self._reaper_task = asyncio.create_task(self._reap_loop(), name="session-reaper")
+
+    async def _reap_loop(self) -> None:
+        log.info(
+            "session reaper started: idle_timeout=%ss interval=%ss",
+            self._idle_timeout_s, self._reap_interval_s,
+        )
+        while True:
+            try:
+                await asyncio.sleep(self._reap_interval_s)
+                await self._reap_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — one bad scan mustn't kill the loop
+                log.exception("session reaper iteration failed")
+
+    async def _reap_idle(self) -> None:
+        timeout = self._idle_timeout_s
+        if not timeout:
+            return
+        to_close: list[tuple[str, Session]] = []
+        async with self._lock:
+            for key, session in list(self._sessions.items()):
+                # Skip sessions mid-turn; only evict idle ones. Keep the resume
+                # id (don't touch _resume_ids) so the next message resumes.
+                if session.is_busy or session.idle_seconds < timeout:
+                    continue
+                to_close.append((key, session))
+                self._sessions.pop(key, None)
+        for key, session in to_close:
+            idle = session.idle_seconds
+            try:
+                await session.close()
+            except Exception:  # noqa: BLE001
+                log.exception("reap: close failed for key=%s", key)
+            else:
+                log.info("reaped idle session %s (idle %.0fs)", key, idle)

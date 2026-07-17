@@ -27,11 +27,22 @@ some requests.
 
 ## Setting up Claude Code
 
-Get Claude Code installed and authenticated, you will need to add an API key or login with a subscription.
+1. Get Claude Code installed and authenticated, you will need to add an API key or login with a subscription.
+
+2. Setup browser automation via `Claude-in-Chrome` (best) or `Chrome devtools` MCP.
+
+3. Make sure the Github CLI `gh` is installed and authenticated into Github. It should be on the path
+so it's usable by Claude.
+
+## Pushing code from your agent
+
+We created a separate Github user account to use for our bot. This gives you bot a full Github idenity but
+costs you a seat.
+
+You can also use a Github App instead and configure the bot as a Github bot user.
 
 
-
-## Running from source
+# Running from source
 
 Two self-contained apps:
 

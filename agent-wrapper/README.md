@@ -64,6 +64,13 @@ On start it:
 - Streams replies into a single Slack message, edited in place.
 - Meta commands: `!stop` (interrupt the running turn), `!clear` (reset the
   thread's session), `!help`.
+- **Serialized turns:** a second message in a thread whose turn is still running
+  waits behind it, showing a *"⏳ queued…"* placeholder until it starts.
+- **Idle-session eviction:** each thread pins an ~80–130 MB `claude` subprocess.
+  A background reaper closes sessions idle longer than `SESSION_IDLE_TIMEOUT_S`
+  (default `14400` = 4h; `0` disables), scanning every `SESSION_REAP_INTERVAL_S`
+  (default `300`). The thread's resume id is kept, so the next message in a
+  reaped thread transparently resumes the same conversation.
 - Events are acked by sequence; if the agent-wrapper is offline, Central-Dispatch holds events
   and replays them on reconnect.
 
