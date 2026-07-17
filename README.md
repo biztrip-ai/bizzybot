@@ -25,6 +25,11 @@ login with Slack, add the Slack app to your workspace, then run the agent-wrappe
 That's it! Invite the Slack app (one of `@cosmo`, `@bizzy` or `@omni`) into a channel and send it
 some requests.
 
+## Setting up Claude Code
+
+Get Claude Code installed and authenticated, you will need to add an API key or login with a subscription.
+
+
 
 ## Running from source
 
