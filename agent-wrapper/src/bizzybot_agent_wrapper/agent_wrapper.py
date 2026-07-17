@@ -237,7 +237,9 @@ def preflight() -> None:
 
 def build_session_manager() -> SessionManager:
     extra_args: dict[str, str | None] = {}
-    if _truthy(os.getenv("CLAUDE_CHROME", "0")):
+    # Chrome (Claude-in-Chrome browser MCP) is on by default so target envs don't
+    # each have to set it; disable explicitly with CLAUDE_CHROME=0.
+    if _truthy(os.getenv("CLAUDE_CHROME", "1")):
         extra_args["chrome"] = None
     cwd = os.getenv("CLAUDE_CWD") or os.path.expanduser("~")
     mcp_servers = (
