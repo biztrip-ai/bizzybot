@@ -1,6 +1,6 @@
 """User settings file for an agent.
 
-A dotenv-style `KEY=value` file (default ``~/.claudebot/settings.env``) that a
+A dotenv-style `KEY=value` file (default ``~/.bizzybot/settings.env``) that a
 workspace owner edits by hand to customize their agent without touching the
 agent-wrapper's own .env or the process environment. The real environment wins
 on conflicts, so a value set in the shell/.env still overrides the file.
@@ -31,8 +31,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api"
 
 
 def settings_path() -> str:
-    """Path to the settings file (``$CLAUDEBOT_SETTINGS_FILE`` overrides)."""
-    return os.environ.get("CLAUDEBOT_SETTINGS_FILE") or state_path(SETTINGS_FILE)
+    """Path to the settings file (``$BIZZYBOT_SETTINGS_FILE`` overrides)."""
+    return os.environ.get("BIZZYBOT_SETTINGS_FILE") or state_path(SETTINGS_FILE)
 
 
 def load_settings(path: Optional[str] = None) -> dict[str, str]:

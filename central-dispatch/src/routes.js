@@ -31,7 +31,7 @@ export const router = express.Router();
 
 // Source repo — linked from the dashboard, and where the install command below
 // pulls the agent-wrapper from.
-const REPO_URL = 'https://github.com/biztrip-ai/claudebot';
+const REPO_URL = 'https://github.com/biztrip-ai/bizzybot';
 
 function fmtAgo(ts) {
   if (!ts) return 'never';
@@ -56,9 +56,9 @@ router.get('/', (req, res) => {
   const canInstall = Boolean(config.slack.clientId);
   const sess = getSession(req);
   res.type('html').send(`<!doctype html><meta charset="utf-8">
-<title>Claudebot</title>
+<title>Bizzybot</title>
 <body style="font-family:system-ui;max-width:640px;margin:48px auto;padding:0 16px">
-<h1>Claudebot</h1>
+<h1>Bizzybot</h1>
 <p>A Slack-native AI teammate you self-host.</p>
 ${
   !canInstall
@@ -66,7 +66,7 @@ ${
     : sess
       ? `<p>${btn('/dashboard', 'Open dashboard')}<a href="/logout">sign out</a></p>`
       : `<p>${btn('/login', 'Sign in with Slack')}</p>
-<p style="color:#666;font-size:14px">Sign in with your Slack account first. Once you're in, you can add the Claudebot app to your workspace.</p>`
+<p style="color:#666;font-size:14px">Sign in with your Slack account first. Once you're in, you can add the Bizzybot app to your workspace.</p>`
 }
 </body>`);
 });
@@ -185,7 +185,7 @@ router.get('/dashboard', async (req, res) => {
 
   res.type('html').send(`<!doctype html><meta charset="utf-8">
 <meta http-equiv="refresh" content="10">
-<title>Claudebot — ${escapeHtml(workspace)}</title>
+<title>Bizzybot — ${escapeHtml(workspace)}</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.5">
 <p style="color:#666;display:flex;gap:8px;align-items:baseline">
   <span>Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></span>
@@ -200,8 +200,8 @@ ${cards}${orphanCards}
 <p>On the machine where an agent should run, install the wrapper once:</p>
 <pre style="${preStyle}">uv tool install "git+${REPO_URL}.git#subdirectory=agent-wrapper"</pre>
 <p>Then start it, once per agent, pasting that agent's registration token when prompted:</p>
-<pre style="${preStyle}">claudebot</pre>
-<p style="color:#666;font-size:14px">Requires <code>claude</code> and <code>gh</code> on PATH. Keep registration tokens secret. Run each agent in its own directory (<code>CLAUDEBOT_STATE_DIR</code>) so they don't share state.</p>
+<pre style="${preStyle}">bizzybot</pre>
+<p style="color:#666;font-size:14px">Requires <code>claude</code> and <code>gh</code> on PATH. Keep registration tokens secret. Run each agent in its own directory (<code>BIZZYBOT_STATE_DIR</code>) so they don't share state.</p>
 <script>
 function copyTok(id,btn){
   var el=document.getElementById(id);

@@ -16,36 +16,36 @@ keep-alive, and bot-token plumbing. It uses your own local `git`/`gh` auth.
 ## Install
 
 ```bash
-uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"
+uv tool install "git+https://github.com/biztrip-ai/bizzybot.git#subdirectory=agent-wrapper"
 ```
 
-(or `pipx install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"`).
-This puts a `claudebot` command on your PATH. To update later:
-`uv tool upgrade claudebot-agent-wrapper`.
+(or `pipx install "git+https://github.com/biztrip-ai/bizzybot.git#subdirectory=agent-wrapper"`).
+This puts a `bizzybot` command on your PATH. To update later:
+`uv tool upgrade bizzybot-agent-wrapper`.
 
 ## Run
 
 ```bash
-claudebot
+bizzybot
 ```
 
 On first run it **prompts for your registration token** (get it by signing in at
-the Central-Dispatch dashboard) and caches it in `~/.claudebot/agent-wrapper-config.json`,
-so later runs need no arguments. `CENTRAL_URL` defaults to the hosted Claudebot —
+the Central-Dispatch dashboard) and caches it in `~/.bizzybot/agent-wrapper-config.json`,
+so later runs need no arguments. `CENTRAL_URL` defaults to the hosted Bizzybot —
 override it (env, `.env`, or the saved config) only to point at your own
 Central-Dispatch. You can also skip the prompt by setting `REGISTRATION_TOKEN` in
 the environment or `.env`:
 
 ```bash
-CENTRAL_URL=https://your-central-dispatch REGISTRATION_TOKEN=<token> claudebot
+CENTRAL_URL=https://your-central-dispatch REGISTRATION_TOKEN=<token> bizzybot
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/biztrip-ai/claudebot.git
-cd claudebot/agent-wrapper
-uv run claudebot
+git clone https://github.com/biztrip-ai/bizzybot.git
+cd bizzybot/agent-wrapper
+uv run bizzybot
 ```
 
 On start it:
@@ -56,12 +56,12 @@ On start it:
 2. Runs a **preflight** — checks Claude Code (fatal if missing), `gh` auth, and
    git identity (warnings).
 3. Opens the **WebSocket** and replays anything it missed (via the last acked
-   `seq` in `~/.claudebot/agent-wrapper-state.json`), then handles live events.
+   `seq` in `~/.bizzybot/agent-wrapper-state.json`), then handles live events.
 
 ## Agent settings file
 
-Per-agent settings live in `~/.claudebot/settings.env` (override the path with
-`CLAUDEBOT_SETTINGS_FILE`) — a dotenv-style file you edit by hand. Every key in
+Per-agent settings live in `~/.bizzybot/settings.env` (override the path with
+`BIZZYBOT_SETTINGS_FILE`) — a dotenv-style file you edit by hand. Every key in
 it is passed through to each `claude` subprocess as an environment variable, so
 it's also the place for provider keys or other per-agent env. Real environment
 variables win over the file, and changes take effect on the next restart.
@@ -73,7 +73,7 @@ instead of Anthropic ([OpenRouter's Claude Code
 guide](https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration)):
 
 ```bash
-# ~/.claudebot/settings.env
+# ~/.bizzybot/settings.env
 OPENROUTER_API_KEY=sk-or-v1-...
 OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
 ```
@@ -108,7 +108,7 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 
 ## State files
 
-Kept in `~/.claudebot/` (override with `CLAUDEBOT_STATE_DIR`):
+Kept in `~/.bizzybot/` (override with `BIZZYBOT_STATE_DIR`):
 
 - `agent-wrapper-config.json` — cached registration token (+ Central-Dispatch URL),
   written on first-run prompt. Holds a secret; kept `0600`.

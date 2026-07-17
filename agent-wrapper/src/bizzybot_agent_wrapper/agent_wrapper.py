@@ -1,4 +1,4 @@
-"""Claudebot OSS agent-wrapper.
+"""Bizzybot OSS agent-wrapper.
 
 Runs in the agent workspace (a laptop, VM, or container — set up by hand). It:
   1. dials home to Central-Dispatch with a registration token and pulls the Slack bot
@@ -10,8 +10,8 @@ Runs in the agent workspace (a laptop, VM, or container — set up by hand). It:
      replies straight back to Slack.
 
 No Ably, no cloud provisioning, no idle keep-alive. Uses your own local git/gh
-auth. Installed as the `claudebot` command (see pyproject [project.scripts]);
-run from source with `uv run claudebot`.
+auth. Installed as the `bizzybot` command (see pyproject [project.scripts]);
+run from source with `uv run bizzybot`.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("agent-wrapper")
 
-# Per-user state dir (~/.claudebot by default) — see paths.state_path.
+# Per-user state dir (~/.bizzybot by default) — see paths.state_path.
 STATE_PATH = state_path("agent-wrapper-state.json")
 CONFIG_PATH = state_path("agent-wrapper-config.json")
 
@@ -77,12 +77,12 @@ def _insecure_tls_ctx(url: str):
     cert), return an SSL context that skips verification. Returns None for plain
     http/ws or real remote hosts, which keep normal verification.
 
-    Enable for non-localhost hosts with CLAUDEBOT_INSECURE_TLS=1 if needed.
+    Enable for non-localhost hosts with BIZZYBOT_INSECURE_TLS=1 if needed.
     """
     if not (url.startswith("https") or url.startswith("wss")):
         return None
     is_local = "localhost" in url or "127.0.0.1" in url
-    if not (is_local or _truthy(os.getenv("CLAUDEBOT_INSECURE_TLS"))):
+    if not (is_local or _truthy(os.getenv("BIZZYBOT_INSECURE_TLS"))):
         return None
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -153,7 +153,7 @@ def resolve_token(central_dispatch: str) -> tuple[str, bool]:
 
 
 def _prompt_for_token(central_dispatch: str) -> str:
-    print("\n  Claudebot agent-wrapper — first-time setup")
+    print("\n  Bizzybot agent-wrapper — first-time setup")
     print(f"  Central-Dispatch: {central_dispatch}")
     print(f"  Sign in at {central_dispatch} and open your dashboard to copy your registration token.\n")
     try:
@@ -243,7 +243,7 @@ def build_session_manager() -> SessionManager:
     mcp_servers = (
         load_cli_mcp_servers(cwd) if _truthy(os.getenv("CLAUDE_LOAD_CLI_MCP", "1")) else {}
     )
-    # The user's settings file (~/.claudebot/settings.env) — passed through to
+    # The user's settings file (~/.bizzybot/settings.env) — passed through to
     # each claude subprocess, and the source of an alternate model provider.
     env, provider_model = claude_env(load_settings())
     model = os.getenv("CLAUDE_MODEL") or None
@@ -669,7 +669,7 @@ async def main() -> None:
 
 
 def main_sync() -> None:
-    """Console-script entry point (`claudebot`). Sync wrapper around main()."""
+    """Console-script entry point (`bizzybot`). Sync wrapper around main()."""
     asyncio.run(main())
 
 

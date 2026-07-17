@@ -2,7 +2,7 @@
 
 Installed as a package, we must NOT write next to our own code (site-packages
 is the wrong place and gets wiped on upgrade). State lives in a stable per-user
-directory instead: ``$CLAUDEBOT_STATE_DIR`` if set, else ``~/.claudebot``.
+directory instead: ``$BIZZYBOT_STATE_DIR`` if set, else ``~/.bizzybot``.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import os
 
 def state_dir() -> str:
     """Return the state directory, creating it if needed."""
-    d = os.environ.get("CLAUDEBOT_STATE_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claudebot"
+    d = os.environ.get("BIZZYBOT_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".bizzybot"
     )
     os.makedirs(d, exist_ok=True)
     return d

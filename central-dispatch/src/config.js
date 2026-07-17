@@ -16,7 +16,7 @@ function parseSlackApps() {
       if (Array.isArray(arr) && arr.length) {
         return arr.map((a) => ({
           appId: a.appId || a.app_id || '',
-          name: a.name || 'Claudebot',
+          name: a.name || 'Bizzybot',
           clientId: a.clientId || a.client_id || '',
           clientSecret: a.clientSecret || a.client_secret || '',
           signingSecret: a.signingSecret || a.signing_secret || '',
@@ -30,7 +30,7 @@ function parseSlackApps() {
   return [
     {
       appId: process.env.SLACK_APP_ID || '',
-      name: process.env.SLACK_APP_NAME || 'Claudebot',
+      name: process.env.SLACK_APP_NAME || 'Bizzybot',
       clientId: process.env.SLACK_CLIENT_ID || '',
       clientSecret: process.env.SLACK_CLIENT_SECRET || '',
       signingSecret: process.env.SLACK_SIGNING_SECRET || '',

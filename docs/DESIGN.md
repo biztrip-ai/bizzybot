@@ -1,11 +1,11 @@
-# Claudebot OSS — High-Level Design
+# Bizzybot OSS — High-Level Design
 
 **Status:** Draft
 **Date:** 2026-07-16
 
 ## What this is
 
-An open-source, monorepo version of Claudebot. It keeps the core idea — an AI
+An open-source, monorepo version of Bizzybot. It keeps the core idea — an AI
 teammate you talk to in Slack — and stays a **hosted, multi-tenant service** (one
 deployment, e.g. on Railway, serves many independent Slack workspaces). What it
 strips out is the **cloud workspace machinery**: Central-Dispatch provisions no compute;
@@ -141,7 +141,7 @@ back — no cloud workspace is provisioned.
    displays a one-time **registration token** for the user to copy. The agent-wrapper
    uses it to authenticate to Central-Dispatch and pull the actual Slack bot token.
 3. **Instructions to install the agent-wrapper.** Central-Dispatch shows the command to run,
-   e.g. `npx @claudebot/agent-wrapper`.
+   e.g. `npx @bizzybot/agent-wrapper`.
 4. **Start the agent-wrapper, paste the token.** The user runs the agent-wrapper in their
    chosen workspace (laptop / VM / container) and enters the registration token
    when prompted.
@@ -269,7 +269,7 @@ reference host).
 A working loop: Slack message → Central-Dispatch webhook → event log → WebSocket →
 agent-wrapper → Claude Code → reply in Slack, with the agent workspace set up by hand
 and registered via dial-home. Central-Dispatch runs with `npm start` (no broker, no
-managed services); the agent-wrapper is a hand-run `claudebot` (installed via
+managed services); the agent-wrapper is a hand-run `bizzybot` (installed via
 `uv tool install`).
 **Status: working end to end** (Central-Dispatch on Railway/behind a tunnel, agent-wrapper on a
 laptop).

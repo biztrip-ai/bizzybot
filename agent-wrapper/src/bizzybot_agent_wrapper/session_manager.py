@@ -79,7 +79,7 @@ def load_cli_mcp_servers(cwd: Optional[str] = None) -> dict[str, dict]:
     return servers
 
 # Thread -> claude session_id map, persisted in the per-user state dir
-# (~/.claudebot) so it survives a restart/upgrade. Lets a restarted agent-wrapper
+# (~/.bizzybot) so it survives a restart/upgrade. Lets a restarted agent-wrapper
 # RESUME each thread's prior conversation (full transcript) instead of starting
 # a blank one. (A rebuild wipes ~/.claude transcripts, so resume falls back to a
 # fresh session there — handled in Session._ensure_connected.)

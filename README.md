@@ -22,7 +22,7 @@ login with Slack, add the Slack app to your workspace, then run the agent-wrappe
 2. Add the Slack app to your workspace
 3. Configure `Claude Code` on your local machine (see below)
 4. Run the `agent-wrapper` on your local machine  
-> `uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"`
+> `uv tool install "git+https://github.com/biztrip-ai/bizzybot.git#subdirectory=agent-wrapper"`
 5. Enter your 'registration key' into the agent-wrapper: this connects it to the Slack listener 
 
 That's it! Invite the Slack app (one of `@cosmo`, `@bizzy` or `@omni`) into a channel and send it
@@ -46,7 +46,7 @@ serves. OpenRouter supports tons of models, including ones you can use for
 *free* which still work pretty well with Claude Code. We have tested `tencent/hy3:free`
 and it worked pretty well!
 
-Create `~/.claudebot/settings.env` on the agent's machine and set both keys:
+Create `~/.bizzybot/settings.env` on the agent's machine and set both keys:
 
 ```bash
 OPENROUTER_API_KEY=sk-or-v1-...
@@ -124,14 +124,14 @@ npm start               # http://localhost:3000
 ```
 
 **Agent-Wrapper** (Python 3.11+ with [`uv`](https://docs.astral.sh/uv/), plus `claude`
-and `gh` installed). Install the `claudebot` command, then run it:
+and `gh` installed). Install the `bizzybot` command, then run it:
 
 ```bash
-uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"
-CENTRAL_URL=http://localhost:3000 REGISTRATION_TOKEN=<token> claudebot
+uv tool install "git+https://github.com/biztrip-ai/bizzybot.git#subdirectory=agent-wrapper"
+CENTRAL_URL=http://localhost:3000 REGISTRATION_TOKEN=<token> bizzybot
 ```
 
-Or run from source: `cd agent-wrapper && uv run claudebot`.
+Or run from source: `cd agent-wrapper && uv run bizzybot`.
 
 ## License
 
