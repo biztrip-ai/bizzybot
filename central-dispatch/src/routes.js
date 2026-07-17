@@ -58,7 +58,8 @@ ${
     ? '<p><em>Slack is not configured. Set SLACK_CLIENT_ID / SLACK_CLIENT_SECRET.</em></p>'
     : sess
       ? `<p>${btn('/dashboard', 'Open dashboard')}<a href="/logout">sign out</a></p>`
-      : `<p>${btn('/slack/install', 'Add to Slack')}${btn('/login', 'Sign in with Slack', '#611f69')}</p>`
+      : `<p>${btn('/login', 'Sign in with Slack')}</p>
+<p style="color:#666;font-size:14px">Sign in with your Slack account first. Once you're in, you can add the Claudebot app to your workspace.</p>`
 }
 </body>`);
 });
