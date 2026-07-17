@@ -29,6 +29,10 @@ import {
 
 export const router = express.Router();
 
+// Source repo — linked from the dashboard, and where the install command below
+// pulls the agent-wrapper from.
+const REPO_URL = 'https://github.com/biztrip-ai/claudebot';
+
 function fmtAgo(ts) {
   if (!ts) return 'never';
   const s = Math.max(0, Math.floor((Date.now() - Number(ts)) / 1000));
@@ -183,7 +187,10 @@ router.get('/dashboard', async (req, res) => {
 <meta http-equiv="refresh" content="10">
 <title>Claudebot — ${escapeHtml(workspace)}</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.5">
-<p style="color:#666">Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></p>
+<p style="color:#666;display:flex;gap:8px;align-items:baseline">
+  <span>Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></span>
+  <a href="${REPO_URL}" target="_blank" rel="noopener" style="margin-left:auto;color:#4A154B;text-decoration:none;white-space:nowrap">GitHub ↗</a>
+</p>
 <h1>${escapeHtml(workspace)}</h1>
 <p style="color:#666">${
     multi ? `Run up to ${apps.length} agents in this workspace — one per Slack app.` : ''
@@ -191,7 +198,7 @@ router.get('/dashboard', async (req, res) => {
 ${cards}${orphanCards}
 <h3>Install an agent</h3>
 <p>On the machine where an agent should run, install the wrapper once:</p>
-<pre style="${preStyle}">uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"</pre>
+<pre style="${preStyle}">uv tool install "git+${REPO_URL}.git#subdirectory=agent-wrapper"</pre>
 <p>Then start it, once per agent, pasting that agent's registration token when prompted:</p>
 <pre style="${preStyle}">claudebot</pre>
 <p style="color:#666;font-size:14px">Requires <code>claude</code> and <code>gh</code> on PATH. Keep registration tokens secret. Run each agent in its own directory (<code>CLAUDEBOT_STATE_DIR</code>) so they don't share state.</p>
