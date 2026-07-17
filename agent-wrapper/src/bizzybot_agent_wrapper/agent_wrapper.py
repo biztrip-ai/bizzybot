@@ -32,6 +32,7 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
+from . import email_reply
 from .paths import state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings
@@ -436,9 +437,95 @@ async def handle_user_message(
         log.exception("session error on %s", thread_key)
         await renderer.replace_with(f":warning: error: `{e}`")
 
-    paths = [m.group(1).strip() for m in ATTACH_RE.finditer("\n".join(full_text))]
+    joined = "\n".join(full_text)
+    paths = [m.group(1).strip() for m in ATTACH_RE.finditer(joined)]
     if paths:
         await upload_files(slack, channel, reply_ts, paths)
+
+    # For an email-triggered turn, send Claude's composed reply by email. The
+    # Mailgun key lives only in this payload context — never in the Claude turn.
+    email_ctx = payload.get("_email")
+    if email_ctx:
+        await _send_email_reply(email_ctx, joined, channel, reply_ts, slack)
+
+
+async def _send_email_reply(
+    ctx: dict, turn_text: str, channel: str, reply_ts: str, slack: AsyncWebClient
+) -> None:
+    """Extract Claude's reply block from the turn and send it via Mailgun,
+    posting a short outcome note to the Slack thread."""
+    body = email_reply.extract_reply(turn_text)
+    if not body:
+        await slack.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=":information_source: No reply sent (no reply block in the response).",
+        )
+        return
+    ok, detail = await email_reply.send_reply(
+        ctx.get("mailgun") or {},
+        to_addr=ctx.get("from_addr") or "",
+        from_addr=ctx.get("recipient") or "",
+        subject=ctx.get("subject") or "",
+        body=body,
+        in_reply_to=ctx.get("message_id"),
+    )
+    if ok:
+        await slack.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=f":white_check_mark: Email reply sent to {ctx.get('from_addr')}.",
+        )
+    else:
+        log.warning("email reply send failed: %s", detail)
+        await slack.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=f":warning: Couldn't send the email reply: `{detail}`",
+        )
+
+
+async def handle_email_event(
+    payload: dict[str, Any], sessions: SessionManager, slack: AsyncWebClient
+) -> None:
+    """An inbound email routed to this agent by Central (see docs/EMAIL.md):
+    announce it in the configured channel, then run a Claude turn (in that
+    thread) to compose a reply, which is sent by email afterward."""
+    channel = payload.get("channel")
+    if not channel:
+        log.warning("email event missing channel; dropping %s", payload.get("message_id"))
+        return
+    sender = payload.get("from_raw") or payload.get("from_addr") or "unknown sender"
+    subject = payload.get("subject") or "(no subject)"
+    body = payload.get("body") or ""
+
+    announce = f":email: *New email* from {sender}\n> *{subject}*"
+    if body:
+        snippet = " ".join(body.split())
+        if len(snippet) > 200:
+            snippet = snippet[:199] + "…"
+        announce += f"\n> {snippet}"
+    try:
+        resp = await slack.chat_postMessage(channel=channel, text=announce)
+    except Exception:  # noqa: BLE001
+        log.exception("email announce failed for %s", payload.get("message_id"))
+        return
+    parent_ts = resp["ts"]
+
+    synth = {
+        "thread_key": f"{channel}:{parent_ts}",
+        "channel": channel,
+        "reply_thread_ts": parent_ts,
+        "text": email_reply.build_instruction(sender=sender, subject=subject, body=body),
+        "files": [],
+        # Reply context (incl. the transient Mailgun creds) for the post-turn
+        # send. Deliberately NOT part of the prompt text above.
+        "_email": {
+            "message_id": payload.get("message_id"),
+            "from_addr": payload.get("from_addr"),
+            "recipient": payload.get("recipient"),
+            "subject": subject,
+            "mailgun": payload.get("mailgun") or {},
+        },
+    }
+    await handle_user_message(synth, sessions, slack)
 
 
 async def handle_clear(payload: dict, sessions: SessionManager, slack: AsyncWebClient) -> None:
@@ -602,7 +689,7 @@ async def consume(
                             continue
                         if data.get("type") == "event" and isinstance(data.get("seq"), int):
                             t = asyncio.create_task(
-                                process(data["seq"], (data.get("event") or {}).get("payload"))
+                                process(data["seq"], data.get("event") or {})
                             )
                             inflight.add(t)
                             t.add_done_callback(inflight.discard)
@@ -661,8 +748,17 @@ async def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        async def on_event(payload: Any) -> None:
-            await dispatch_event(payload, sessions, slack)
+        async def on_event(event: Any) -> None:
+            # Central wraps each event as {type, payload}. Slack events go through
+            # the normal dispatch; 'email' events (see docs/EMAIL.md) are handled
+            # directly. Default to slack for anything untyped (back-compat).
+            event = event or {}
+            etype = event.get("type")
+            payload = event.get("payload")
+            if etype == "email":
+                await handle_email_event(payload, sessions, slack)
+            else:
+                await dispatch_event(payload, sessions, slack)
 
         try:
             await consume(http, ws_url, ws_token, on_event, stop)
