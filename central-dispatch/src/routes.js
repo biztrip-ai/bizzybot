@@ -114,10 +114,11 @@ router.get('/dashboard', async (req, res) => {
         online ? '🟢 online' : `⚪️ offline · last seen ${fmtAgo(agent.last_seen_at)}`
       }</b></p>
        <h3>Connect your teammate</h3>
-       <p>On the machine where the teammate should run:</p>
-       <pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">CENTRAL_URL=${escapeHtml(config.publicUrl)}
-REGISTRATION_TOKEN=${escapeHtml(agent.registration_token)}</pre>
-       <p>Then run <code>uv run python agent_wrapper.py</code>. Keep the registration token secret.</p>`
+       <p>On the machine where the teammate should run, install it once:</p>
+       <pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"</pre>
+       <p>Then start it with your registration token:</p>
+       <pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">CENTRAL_URL=${escapeHtml(config.publicUrl)} REGISTRATION_TOKEN=${escapeHtml(agent.registration_token)} claudebot</pre>
+       <p>Requires <code>claude</code> and <code>gh</code> on PATH. Keep the registration token secret.</p>`
     : `<p>No teammate is installed in this workspace yet.</p>
        <p>${btn('/slack/install', 'Add to Slack')}</p>`;
 

@@ -10,7 +10,8 @@ Runs in the agent workspace (a laptop, VM, or container — set up by hand). It:
      replies straight back to Slack.
 
 No Ably, no cloud provisioning, no idle keep-alive. Uses your own local git/gh
-auth. Run:  uv run python agent_wrapper.py
+auth. Installed as the `claudebot` command (see pyproject [project.scripts]);
+run from source with `uv run claudebot`.
 """
 
 from __future__ import annotations
@@ -31,8 +32,9 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
-from session_manager import SessionManager, load_cli_mcp_servers
-from slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
+from .paths import state_path
+from .session_manager import SessionManager, load_cli_mcp_servers
+from .slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
 
 load_dotenv()
 
@@ -42,9 +44,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("agent-wrapper")
 
-STATE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_PATH = os.path.join(STATE_DIR, ".agent-wrapper-state.json")
-CONFIG_PATH = os.path.join(STATE_DIR, ".agent-wrapper-config.json")
+# Per-user state dir (~/.claudebot by default) — see paths.state_path.
+STATE_PATH = state_path("agent-wrapper-state.json")
+CONFIG_PATH = state_path("agent-wrapper-config.json")
 
 # Default hosted Central-Dispatch. Override with CENTRAL_URL (env/.env) or the saved config.
 DEFAULT_CENTRAL_URL = "https://claudebot-production-34ba.up.railway.app"
@@ -641,5 +643,10 @@ async def main() -> None:
             await sessions.close_all()
 
 
-if __name__ == "__main__":
+def main_sync() -> None:
+    """Console-script entry point (`claudebot`). Sync wrapper around main()."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    main_sync()

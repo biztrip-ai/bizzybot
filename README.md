@@ -4,14 +4,27 @@ Integrate a Claude Code agent into your Slack workspace.
 
 ## Getting started
 
-The easiest way to run is to use our pre-created Slack apps and `eventmgr` app which is
+The easiest way to run is to use our pre-created Slack app and `central-dispatch` event service which is
 running on Railway. 
 
 Just visit:
 
-     https://claudebot-production-34ba.up.railway.app
+[https://claudebot-production-34ba.up.railway.app](https://claudebot-production-34ba.up.railway.app)
 
-and app the Slack app, then run the agent-wrapper on your machine.
+login with Slack, add the Slack app to your workspace, then run the agent-wrapper on your machine.
+
+
+## Key steps
+
+1. Sign-in with your Slack account
+2. Add the Slack app to your workspace
+3. Configure `Claude Code` on your local machine (see below)
+4. Run the `agent-wrapper` on your local machine
+5. Enter your 'registration key' into the agent-wrapper: this connects it to the Slack listener 
+
+That's it! Invite the Slack app (one of `@cosmo`, `@bizzy` or `@omni`) into a channel and send it
+some requests.
+
 
 ## Running from source
 
@@ -39,13 +52,14 @@ npm start               # http://localhost:3000
 ```
 
 **Agent-Wrapper** (Python 3.11+ with [`uv`](https://docs.astral.sh/uv/), plus `claude`
-and `gh` installed):
+and `gh` installed). Install the `claudebot` command, then run it:
 
 ```bash
-cd agent-wrapper
-cp .env.example .env    # set CENTRAL_URL + REGISTRATION_TOKEN
-uv run python agent_wrapper.py
+uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"
+CENTRAL_URL=http://localhost:3000 REGISTRATION_TOKEN=<token> claudebot
 ```
+
+Or run from source: `cd agent-wrapper && uv run claudebot`.
 
 ## License
 

@@ -27,6 +27,8 @@ from claude_agent_sdk.types import (
     UserMessage,
 )
 
+from .paths import state_path
+
 log = logging.getLogger("claude-slack-bot.session")
 
 
@@ -75,12 +77,12 @@ def load_cli_mcp_servers(cwd: Optional[str] = None) -> dict[str, dict]:
                  len(servers), ", ".join(sorted(servers)))
     return servers
 
-# Thread -> claude session_id map, persisted on the /workspaces volume (next to
-# this file) so it survives a codespace stop/start. Lets a restarted agent-wrapper
+# Thread -> claude session_id map, persisted in the per-user state dir
+# (~/.claudebot) so it survives a restart/upgrade. Lets a restarted agent-wrapper
 # RESUME each thread's prior conversation (full transcript) instead of starting
 # a blank one. (A rebuild wipes ~/.claude transcripts, so resume falls back to a
 # fresh session there — handled in Session._ensure_connected.)
-_SESSION_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sessions.json")
+_SESSION_STORE = state_path("sessions.json")
 
 # Prepended to the first prompt after a resume so the agent re-orients instead of
 # acting like a brand-new conversation (the prior transcript is already loaded).

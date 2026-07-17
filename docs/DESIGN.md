@@ -269,6 +269,7 @@ reference host).
 A working loop: Slack message → Central-Dispatch webhook → event log → WebSocket →
 agent-wrapper → Claude Code → reply in Slack, with the agent workspace set up by hand
 and registered via dial-home. Central-Dispatch runs with `npm start` (no broker, no
-managed services); the agent-wrapper is a hand-run `uv run python agent_wrapper.py`.
+managed services); the agent-wrapper is a hand-run `claudebot` (installed via
+`uv tool install`).
 **Status: working end to end** (Central-Dispatch on Railway/behind a tunnel, agent-wrapper on a
 laptop).
