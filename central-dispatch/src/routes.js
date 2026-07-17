@@ -109,17 +109,27 @@ router.get('/dashboard', async (req, res) => {
   const workspace = agent?.name || sess.teamName || sess.teamId;
   const online = agent ? onlineIds().has(agent.id) : false;
 
+  const preStyle =
+    'background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto';
   const body = agent
-    ? `<p>Slack: <b>✅ installed</b> · Agent-Wrapper: <b>${
+    ? `<p>Slack: <b>✅ installed</b> · Agent: <b>${
         online ? '🟢 online' : `⚪️ offline · last seen ${fmtAgo(agent.last_seen_at)}`
       }</b></p>
-       <h3>Connect your teammate</h3>
-       <p>On the machine where the teammate should run, install it once:</p>
-       <pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"</pre>
-       <p>Then start it with your registration token:</p>
-       <pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto">CENTRAL_URL=${escapeHtml(config.publicUrl)} REGISTRATION_TOKEN=${escapeHtml(agent.registration_token)} claudebot</pre>
-       <p>Requires <code>claude</code> and <code>gh</code> on PATH. Keep the registration token secret.</p>`
-    : `<p>No teammate is installed in this workspace yet.</p>
+       <h3>Connect your agent</h3>
+       <p>On the machine where the agent should run, install it once:</p>
+       <pre style="${preStyle}">uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"</pre>
+       <p>Then start it:</p>
+       <pre style="${preStyle}">claudebot</pre>
+       <p>On first run it asks for your <b>registration token</b> — paste this:</p>
+       <div style="display:flex;gap:8px;align-items:center;max-width:520px">
+         <input id="regtok" value="${escapeHtml(agent.registration_token)}" readonly
+           onclick="this.select()"
+           style="flex:1;font-family:ui-monospace,SFMono-Regular,monospace;font-size:13px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;background:#f9f9f9">
+         <button type="button" onclick="copyRegToken(this)"
+           style="padding:8px 14px;border:0;border-radius:6px;background:#4A154B;color:#fff;cursor:pointer;white-space:nowrap">Copy</button>
+       </div>
+       <p style="color:#666;font-size:14px">Requires <code>claude</code> and <code>gh</code> on PATH. Keep the registration token secret.</p>`
+    : `<p>No agent is installed in this workspace yet.</p>
        <p>${btn('/slack/install', 'Add to Slack')}</p>`;
 
   res.type('html').send(`<!doctype html><meta charset="utf-8">
@@ -129,6 +139,17 @@ router.get('/dashboard', async (req, res) => {
 <p style="color:#666">Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></p>
 <h1>${escapeHtml(workspace)}</h1>
 ${body}
+<script>
+function copyRegToken(btn){
+  var el=document.getElementById('regtok');
+  if(!el) return;
+  el.focus(); el.select();
+  var done=function(){ var t=btn.textContent; btn.textContent='Copied!'; setTimeout(function(){btn.textContent=t;},1200); };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(el.value).then(done).catch(function(){ try{document.execCommand('copy'); done();}catch(e){} });
+  } else { try{document.execCommand('copy'); done();}catch(e){} }
+}
+</script>
 </body>`);
 });
 
