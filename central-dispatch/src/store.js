@@ -103,4 +103,8 @@ export async function ackSeq(agentId, seq) {
     agentId,
     seq,
   ]);
+  // An ack means the agent processed everything up to `seq`, so remove those
+  // events from the log — it's a queue, not an archive. Keeps storage bounded
+  // and means a reconnect never re-delivers already-processed events.
+  await run(`DELETE FROM ${EVENTS} WHERE agent_id = ? AND seq <= ?`, [agentId, seq]);
 }

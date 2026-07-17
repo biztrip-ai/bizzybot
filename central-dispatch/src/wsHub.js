@@ -50,7 +50,7 @@ export function attachWsHub(server) {
   wss.on('connection', async (ws, req) => {
     const url = new URL(req.url, 'http://localhost');
     const token = url.searchParams.get('token');
-    const lastSeq = Number(url.searchParams.get('lastSeq') || 0);
+    const clientLastSeq = Number(url.searchParams.get('lastSeq') || 0);
 
     let agent = null;
     try {
@@ -62,6 +62,13 @@ export function attachWsHub(server) {
       ws.close(4001, 'invalid registration token');
       return;
     }
+
+    // Replay from the furthest-forward cursor we know: the client's last-seen
+    // seq OR the server-recorded ack high-water mark, whichever is higher. This
+    // prevents a reinstalled agent (fresh local state → lastSeq=0) from replaying
+    // — and re-processing — events it already acked. Acked events are also pruned
+    // (see ackSeq), so a caught-up agent has nothing to replay.
+    const lastSeq = Math.max(clientLastSeq, Number(agent.last_acked_seq || 0));
 
     // Register the connection immediately. Live events that arrive during the
     // (async) replay below are buffered on `queue` and flushed afterwards, so
