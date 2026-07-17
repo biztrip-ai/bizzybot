@@ -88,6 +88,33 @@ export async function appendEvent(agentId, type, payload) {
   return isPg ? tx(doIt) : doIt({ get, run });
 }
 
+// Discard events older than `cutoffTs` (epoch ms) for an agent. The event log
+// exists only to wake a briefly-sleeping agent — a message that's been sitting
+// for more than a few minutes is stale and must never be processed. Returns how
+// many were dropped.
+export async function deleteStaleEvents(agentId, cutoffTs) {
+  const row = await get(
+    `SELECT COUNT(*) AS n FROM ${EVENTS} WHERE agent_id = ? AND created_at < ?`,
+    [agentId, cutoffTs],
+  );
+  const n = Number(row?.n || 0);
+  if (n > 0) {
+    await run(`DELETE FROM ${EVENTS} WHERE agent_id = ? AND created_at < ?`, [agentId, cutoffTs]);
+  }
+  return n;
+}
+
+// Sweep stale events across all agents (periodic hygiene, in case an agent
+// stays offline and never reconnects to trigger the per-agent discard).
+export async function deleteAllStaleEvents(cutoffTs) {
+  const row = await get(`SELECT COUNT(*) AS n FROM ${EVENTS} WHERE created_at < ?`, [cutoffTs]);
+  const n = Number(row?.n || 0);
+  if (n > 0) {
+    await run(`DELETE FROM ${EVENTS} WHERE created_at < ?`, [cutoffTs]);
+  }
+  return n;
+}
+
 export async function eventsAfter(agentId, afterSeq) {
   const rows = await all(
     `SELECT seq, type, payload FROM ${EVENTS}

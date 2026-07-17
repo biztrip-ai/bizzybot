@@ -2,7 +2,19 @@
 // agent missed (seq > lastSeq), then live-push new ones. The agent acks by seq.
 import { WebSocketServer } from 'ws';
 import { MSG } from './protocol.js';
-import { getAgentByToken, eventsAfter, ackSeq, touchAgentSeen } from './store.js';
+import {
+  getAgentByToken,
+  eventsAfter,
+  ackSeq,
+  touchAgentSeen,
+  deleteStaleEvents,
+  deleteAllStaleEvents,
+} from './store.js';
+
+// The event log only exists to wake a briefly-sleeping agent. Anything older
+// than this is a stale request that must never be processed on reconnect —
+// discarded on connect and by a periodic sweep. Override with STALE_EVENT_MAX_AGE_MS.
+const STALE_EVENT_MAX_AGE_MS = Number(process.env.STALE_EVENT_MAX_AGE_MS || 10 * 60 * 1000);
 
 const connections = new Map(); // agentId -> { ws, ready, queue }
 
@@ -46,6 +58,15 @@ function send(ws, ev) {
 
 export function attachWsHub(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
+
+  // Periodic hygiene: discard stale events even for agents that never reconnect.
+  const sweepEvery = Math.min(STALE_EVENT_MAX_AGE_MS, 5 * 60 * 1000);
+  const sweep = setInterval(() => {
+    deleteAllStaleEvents(Date.now() - STALE_EVENT_MAX_AGE_MS)
+      .then((n) => n && console.log(`[ws] stale-event sweep discarded ${n} event(s)`))
+      .catch((e) => console.error('[ws] stale-event sweep failed:', e));
+  }, sweepEvery);
+  sweep.unref?.();
 
   wss.on('connection', async (ws, req) => {
     const url = new URL(req.url, 'http://localhost');
@@ -98,6 +119,16 @@ export function attachWsHub(server) {
     });
 
     try {
+      // Failsafe: drop anything that's been waiting too long before replaying,
+      // so a reconnecting agent never acts on a stale request.
+      const dropped = await deleteStaleEvents(agent.id, Date.now() - STALE_EVENT_MAX_AGE_MS);
+      if (dropped) {
+        console.log(
+          `[ws] discarded ${dropped} stale event(s) (>${Math.round(
+            STALE_EVENT_MAX_AGE_MS / 60000,
+          )}m) for agent ${agent.id}`,
+        );
+      }
       const missed = await eventsAfter(agent.id, lastSeq);
       for (const ev of missed) send(ws, ev);
       // Flush live events queued during replay, skipping any already replayed.
