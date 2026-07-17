@@ -241,7 +241,7 @@ router.get('/dashboard', async (req, res) => {
   <span>Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></span>
   <a href="${REPO_URL}" target="_blank" rel="noopener" style="margin-left:auto;color:#4A154B;text-decoration:none;white-space:nowrap">GitHub ↗</a>
 </p>
-<h1>${escapeHtml(workspace)}</h1>
+<h1>Slack workspace: ${escapeHtml(workspace)}</h1>
 ${errBanner}
 <p style="color:#666">${
     multi ? `Run up to ${apps.length} agents in this workspace — one per Slack app.` : ''
