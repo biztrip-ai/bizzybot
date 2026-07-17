@@ -19,7 +19,7 @@ export async function getAgentByToken(token) {
 
 export async function listAgents() {
   const rows = await all(
-    `SELECT id, name, slack_team_id, registered_at, last_seen_at,
+    `SELECT id, name, slack_team_id, slack_app_id, registered_at, last_seen_at,
             CASE WHEN slack_bot_token IS NOT NULL AND slack_bot_token <> '' THEN 1 ELSE 0 END AS slack_connected
        FROM ${AGENTS} ORDER BY created_at`,
   );
@@ -27,6 +27,20 @@ export async function listAgents() {
     ...r,
     slack_connected: Boolean(Number(r.slack_connected)),
   }));
+}
+
+export async function getAgentById(id) {
+  return get(`SELECT * FROM ${AGENTS} WHERE id = ?`, [id]);
+}
+
+// All agents bound to a workspace (one per installed Slack app), for the
+// per-tenant dashboard. Includes the registration token so each card can show it.
+export async function listAgentsByTeam(teamId) {
+  return all(
+    `SELECT id, name, slack_app_id, registration_token, last_seen_at
+       FROM ${AGENTS} WHERE slack_team_id = ? ORDER BY created_at`,
+    [teamId],
+  );
 }
 
 // Record that we just saw the agent's agent-wrapper (connect/disconnect), for the
@@ -44,12 +58,22 @@ export async function getAgentByTeam(teamId) {
   );
 }
 
-export async function setAgentSlack(id, { teamId, botToken } = {}) {
-  await run(`UPDATE ${AGENTS} SET slack_team_id = ?, slack_bot_token = ? WHERE id = ?`, [
-    teamId ?? null,
-    botToken ?? null,
-    id,
-  ]);
+// The agent for a specific Slack app within a workspace. With multiple cloned
+// apps in one workspace, (team_id, app_id) — not team_id alone — identifies an
+// agent, so re-installing the same app reuses its agent + registration token.
+export async function getAgentByTeamAndApp(teamId, appId) {
+  if (!appId) return getAgentByTeam(teamId);
+  return get(
+    `SELECT * FROM ${AGENTS} WHERE slack_team_id = ? AND slack_app_id = ? ORDER BY created_at LIMIT 1`,
+    [teamId, appId],
+  );
+}
+
+export async function setAgentSlack(id, { teamId, appId, botToken } = {}) {
+  await run(
+    `UPDATE ${AGENTS} SET slack_team_id = ?, slack_app_id = ?, slack_bot_token = ? WHERE id = ?`,
+    [teamId ?? null, appId ?? null, botToken ?? null, id],
+  );
 }
 
 export async function markRegistered(id, { teamId, botToken } = {}) {

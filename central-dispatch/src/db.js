@@ -94,6 +94,7 @@ export async function init() {
       )`);
     // Idempotent migrations for tables that may predate a column.
     await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS last_seen_at BIGINT`);
+    await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS slack_app_id TEXT`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS ${EVENTS} (
         id         BIGSERIAL PRIMARY KEY,
@@ -112,6 +113,7 @@ export async function init() {
         name               TEXT NOT NULL,
         registration_token TEXT NOT NULL UNIQUE,
         slack_team_id      TEXT,
+        slack_app_id       TEXT,
         slack_bot_token    TEXT,
         created_at         INTEGER NOT NULL,
         registered_at      INTEGER,
@@ -132,6 +134,9 @@ export async function init() {
     const cols = sqlite.prepare(`PRAGMA table_info(agents)`).all().map((c) => c.name);
     if (!cols.includes('last_seen_at')) {
       sqlite.exec(`ALTER TABLE agents ADD COLUMN last_seen_at INTEGER`);
+    }
+    if (!cols.includes('slack_app_id')) {
+      sqlite.exec(`ALTER TABLE agents ADD COLUMN slack_app_id TEXT`);
     }
     console.log(`[central-dispatch] storage: SQLite (${config.dbPath})`);
   }

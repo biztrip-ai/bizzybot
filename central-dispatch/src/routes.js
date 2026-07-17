@@ -5,6 +5,9 @@ import {
   createAgent,
   getAgentByToken,
   getAgentByTeam,
+  getAgentByTeamAndApp,
+  getAgentById,
+  listAgentsByTeam,
   setAgentSlack,
   markRegistered,
   listAgents,
@@ -66,13 +69,28 @@ ${
 
 // --- Slack OAuth install ("Add to Slack") -----------------------------------
 // CSRF states pending a callback (in-memory: single-process Central-Dispatch).
-const pendingStates = new Map(); // state -> expiresAt
+// Value: { expiresAt, appId? } — appId records which Slack app an install is for.
+const pendingStates = new Map();
+
+function newState(extra = {}) {
+  const state = crypto.randomBytes(16).toString('hex');
+  pendingStates.set(state, { expiresAt: Date.now() + 10 * 60 * 1000, ...extra });
+  return state;
+}
+
+// Consume a pending state, returning it iff present and unexpired.
+function takeState(state) {
+  const pending = pendingStates.get(state);
+  pendingStates.delete(state);
+  if (!pending || pending.expiresAt < Date.now()) return null;
+  return pending;
+}
 
 // --- Sign in with Slack (dashboard auth) ------------------------------------
+// Sign-in is workspace identity, so any configured app works — use the primary.
 router.get('/login', (req, res) => {
   if (!config.slack.clientId) return res.status(500).send('Slack not configured');
-  const state = crypto.randomBytes(16).toString('hex');
-  pendingStates.set(state, Date.now() + 10 * 60 * 1000);
+  const state = newState();
   res.redirect(oidcAuthorizeUrl(state, `${config.publicUrl}/auth/slack/callback`));
 });
 
@@ -80,9 +98,7 @@ router.get('/auth/slack/callback', async (req, res) => {
   const { code, state, error } = req.query;
   if (error) return res.status(400).send(`Slack error: ${escapeHtml(error)}`);
   if (!code) return res.status(400).send('missing code');
-  const exp = pendingStates.get(state);
-  pendingStates.delete(state);
-  if (!exp || exp < Date.now()) return res.status(400).send('state mismatch or expired');
+  if (!takeState(state)) return res.status(400).send('state mismatch or expired');
 
   const data = await exchangeOidcCode(code, `${config.publicUrl}/auth/slack/callback`);
   if (!data.ok || !data.id_token) {
@@ -100,37 +116,68 @@ router.get('/logout', (req, res) => {
   res.redirect('/');
 });
 
-// Per-tenant dashboard: the signed-in workspace's own agent only.
+// Per-tenant dashboard: every agent in the signed-in workspace, one card per
+// configured Slack app (a workspace may run several cloned apps / agents).
 router.get('/dashboard', async (req, res) => {
   const sess = getSession(req);
   if (!sess) return res.redirect('/login');
 
-  const agent = await getAgentByTeam(sess.teamId);
-  const workspace = agent?.name || sess.teamName || sess.teamId;
-  const online = agent ? onlineIds().has(agent.id) : false;
+  const workspace = sess.teamName || sess.teamId;
+  const agents = await listAgentsByTeam(sess.teamId);
+  const online = onlineIds();
+  const apps = config.slack.apps;
+  const multi = apps.length > 1;
 
-  const preStyle =
-    'background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto';
-  const body = agent
-    ? `<p>Slack: <b>✅ installed</b> · Agent: <b>${
-        online ? '🟢 online' : `⚪️ offline · last seen ${fmtAgo(agent.last_seen_at)}`
-      }</b></p>
-       <h3>Connect your agent</h3>
-       <p>On the machine where the agent should run, install it once:</p>
-       <pre style="${preStyle}">uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"</pre>
-       <p>Then start it:</p>
-       <pre style="${preStyle}">claudebot</pre>
-       <p>On first run it asks for your <b>registration token</b> — paste this:</p>
-       <div style="display:flex;gap:8px;align-items:center;max-width:520px">
-         <input id="regtok" value="${escapeHtml(agent.registration_token)}" readonly
-           onclick="this.select()"
-           style="flex:1;font-family:ui-monospace,SFMono-Regular,monospace;font-size:13px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;background:#f9f9f9">
-         <button type="button" onclick="copyRegToken(this)"
-           style="padding:8px 14px;border:0;border-radius:6px;background:#4A154B;color:#fff;cursor:pointer;white-space:nowrap">Copy</button>
-       </div>
-       <p style="color:#666;font-size:14px">Requires <code>claude</code> and <code>gh</code> on PATH. Keep the registration token secret.</p>`
-    : `<p>No agent is installed in this workspace yet.</p>
-       <p>${btn('/slack/install', 'Add to Slack')}</p>`;
+  // Match each configured app to its installed agent. With a single app we bind
+  // to whatever agent exists (legacy agents have no slack_app_id); otherwise we
+  // match strictly by App ID.
+  const agentForApp = (app) =>
+    (multi
+      ? agents.find((a) => a.slack_app_id && a.slack_app_id === app.appId)
+      : agents[0]) || null;
+
+  const preStyle = 'background:#f4f4f4;padding:12px;border-radius:6px;overflow:auto';
+  const cardStyle =
+    'border:1px solid #e5e5e5;border-radius:10px;padding:16px 18px;margin:16px 0';
+
+  const installUrl = (app) =>
+    app.appId ? `/slack/install?app=${encodeURIComponent(app.appId)}` : '/slack/install';
+
+  const agentCard = (app, agent, i) => {
+    const label = escapeHtml(agent?.name || app.name || 'Agent');
+    if (!agent) {
+      return `<div style="${cardStyle}">
+        <h3 style="margin:0 0 8px">${label}</h3>
+        <p style="margin:0 0 12px;color:#666">Not installed in this workspace yet.</p>
+        ${btn(installUrl(app), 'Add to Slack')}
+      </div>`;
+    }
+    const status = online.has(agent.id)
+      ? '🟢 online'
+      : `⚪️ offline · last seen ${fmtAgo(agent.last_seen_at)}`;
+    const tokId = `regtok-${i}`;
+    return `<div style="${cardStyle}">
+      <h3 style="margin:0 0 8px">${label}</h3>
+      <p style="margin:0 0 12px">Slack: <b>✅ installed</b> · Agent: <b>${status}</b></p>
+      <p style="margin:0 0 6px">Registration token — paste it on first run of this agent:</p>
+      <div style="display:flex;gap:8px;align-items:center;max-width:520px">
+        <input id="${tokId}" value="${escapeHtml(agent.registration_token)}" readonly
+          onclick="this.select()"
+          style="flex:1;font-family:ui-monospace,SFMono-Regular,monospace;font-size:13px;padding:8px 10px;border:1px solid #ccc;border-radius:6px;background:#f9f9f9">
+        <button type="button" onclick="copyTok('${tokId}',this)"
+          style="padding:8px 14px;border:0;border-radius:6px;background:#4A154B;color:#fff;cursor:pointer;white-space:nowrap">Copy</button>
+      </div>
+    </div>`;
+  };
+
+  const cards = apps.map((app, i) => agentCard(app, agentForApp(app), i)).join('');
+  // Surface any installed agents that don't correspond to a configured app
+  // (e.g. an app removed from SLACK_APPS), so their tokens/status aren't hidden.
+  const matched = new Set(apps.map(agentForApp).filter(Boolean).map((a) => a.id));
+  const orphans = agents.filter((a) => !matched.has(a.id));
+  const orphanCards = orphans
+    .map((a, i) => agentCard({ name: a.name, appId: a.slack_app_id }, a, apps.length + i))
+    .join('');
 
   res.type('html').send(`<!doctype html><meta charset="utf-8">
 <meta http-equiv="refresh" content="10">
@@ -138,10 +185,19 @@ router.get('/dashboard', async (req, res) => {
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.5">
 <p style="color:#666">Signed in as ${escapeHtml(sess.name || 'you')} · <a href="/logout">sign out</a></p>
 <h1>${escapeHtml(workspace)}</h1>
-${body}
+<p style="color:#666">${
+    multi ? `Run up to ${apps.length} agents in this workspace — one per Slack app.` : ''
+  }</p>
+${cards}${orphanCards}
+<h3>Install an agent</h3>
+<p>On the machine where an agent should run, install the wrapper once:</p>
+<pre style="${preStyle}">uv tool install "git+https://github.com/biztrip-ai/claudebot.git#subdirectory=agent-wrapper"</pre>
+<p>Then start it, once per agent, pasting that agent's registration token when prompted:</p>
+<pre style="${preStyle}">claudebot</pre>
+<p style="color:#666;font-size:14px">Requires <code>claude</code> and <code>gh</code> on PATH. Keep registration tokens secret. Run each agent in its own directory (<code>CLAUDEBOT_STATE_DIR</code>) so they don't share state.</p>
 <script>
-function copyRegToken(btn){
-  var el=document.getElementById('regtok');
+function copyTok(id,btn){
+  var el=document.getElementById(id);
   if(!el) return;
   el.focus(); el.select();
   var done=function(){ var t=btn.textContent; btn.textContent='Copied!'; setTimeout(function(){btn.textContent=t;},1200); };
@@ -154,14 +210,15 @@ function copyRegToken(btn){
 });
 
 router.get('/slack/install', (req, res) => {
-  if (!config.slack.clientId) {
-    return res.status(500).send('SLACK_CLIENT_ID not configured');
+  // Which app to install (?app=<App ID>); default to the primary app.
+  const app = config.slack.appById(req.query.app) || config.slack.primary;
+  if (!app.clientId) {
+    return res.status(500).send('Slack client credentials not configured for this app');
   }
-  const state = crypto.randomBytes(16).toString('hex');
-  pendingStates.set(state, Date.now() + 10 * 60 * 1000);
+  const state = newState({ appId: app.appId || null });
 
   const u = new URL('https://slack.com/oauth/v2/authorize');
-  u.searchParams.set('client_id', config.slack.clientId);
+  u.searchParams.set('client_id', app.clientId);
   u.searchParams.set('scope', SLACK_BOT_SCOPES.join(','));
   u.searchParams.set('redirect_uri', `${config.publicUrl}/slack/oauth/callback`);
   u.searchParams.set('state', state);
@@ -173,11 +230,12 @@ router.get('/slack/oauth/callback', async (req, res) => {
   if (error) return res.status(400).send(`Slack error: ${escapeHtml(error)}`);
   if (!code) return res.status(400).send('missing code');
 
-  const exp = pendingStates.get(state);
-  pendingStates.delete(state);
-  if (!exp || exp < Date.now()) return res.status(400).send('state mismatch or expired');
+  const pending = takeState(state);
+  if (!pending) return res.status(400).send('state mismatch or expired');
 
-  const data = await exchangeCode(code, `${config.publicUrl}/slack/oauth/callback`);
+  // Exchange with the same app's client credentials the install was started with.
+  const app = config.slack.appById(pending.appId) || config.slack.primary;
+  const data = await exchangeCode(code, `${config.publicUrl}/slack/oauth/callback`, app);
   if (!data.ok || !data.access_token) {
     return res.status(400).send(`token exchange failed: ${escapeHtml(data.error || 'unknown')}`);
   }
@@ -185,21 +243,33 @@ router.get('/slack/oauth/callback', async (req, res) => {
   const teamId = data.team?.id ?? null;
   const teamName = data.team?.name ?? 'your workspace';
   const botToken = data.access_token;
+  // Slack returns the installed app's id; fall back to the profile's configured id.
+  const appId = data.app_id || app.appId || null;
+  // Name the agent after the Slack app so multiple clones stay distinguishable;
+  // for a lone app keep the workspace name (prior behavior).
+  const agentName = config.slack.apps.length > 1 ? app.name || teamName : teamName || app.name;
 
-  // Reuse the workspace's existing agent (re-auth) or create a new one.
+  // Reuse the agent for this (workspace, app) — re-auth — or create a new one.
   let registrationToken;
-  const existing = teamId ? await getAgentByTeam(teamId) : null;
+  let existing = teamId ? await getAgentByTeamAndApp(teamId, appId) : null;
+  // Migration: if there's no App-ID-bound agent yet but a legacy agent exists
+  // for this workspace (installed before multi-app, so slack_app_id is null),
+  // adopt it — stamping its App ID — instead of creating a duplicate.
+  if (!existing && teamId && appId) {
+    const legacy = await getAgentByTeam(teamId);
+    if (legacy && !legacy.slack_app_id) existing = legacy;
+  }
   if (existing) {
-    await setAgentSlack(existing.id, { teamId, botToken });
+    await setAgentSlack(existing.id, { teamId, appId, botToken });
     registrationToken = existing.registration_token;
   } else {
-    const agent = await createAgent(teamName);
-    await setAgentSlack(agent.id, { teamId, botToken });
+    const agent = await createAgent(agentName);
+    await setAgentSlack(agent.id, { teamId, appId, botToken });
     registrationToken = agent.registrationToken;
   }
 
   // Log the installer in and land them on the dashboard (which shows the token
-  // + live status for this workspace).
+  // + live status for every agent in this workspace).
   setSession(res, {
     teamId,
     userId: data.authed_user?.id ?? null,
@@ -240,8 +310,12 @@ router.post('/slack/events', async (req, res) => {
     return res.json({ challenge: req.body.challenge });
   }
 
+  // Each cloned app has its own signing secret; pick it by the App ID in the
+  // payload so all apps verify (falling back to the primary app's secret).
+  const apiAppId = req.body?.api_app_id || null;
+  const app = config.slack.appById(apiAppId) || config.slack.primary;
   const verified = verifySlackSignature({
-    signingSecret: config.slack.signingSecret,
+    signingSecret: app.signingSecret,
     signature: req.get('x-slack-signature'),
     timestamp: req.get('x-slack-request-timestamp'),
     rawBody: req.rawBody || '',
@@ -254,11 +328,16 @@ router.post('/slack/events', async (req, res) => {
   if (req.body && req.body.type === 'event_callback') {
     const teamId = req.body.team_id || null;
     // Multi-tenant isolation: deliver ONLY to agents bound to this exact Slack
-    // workspace. Never broadcast — that would leak one tenant's events to
-    // another. (A dev/admin agent with a null team only matches team-less test
-    // events, never real workspace traffic.)
+    // workspace, AND — when several cloned apps run in one workspace — only to
+    // the agent for the app this event came from (matched by App ID). Legacy
+    // agents with no slack_app_id match on team alone (single-app behavior).
+    // Never broadcast — that would leak one tenant's (or app's) events.
     try {
-      const targets = (await listAgents()).filter((a) => a.slack_team_id === teamId);
+      const targets = (await listAgents()).filter(
+        (a) =>
+          a.slack_team_id === teamId &&
+          (!a.slack_app_id || !apiAppId || a.slack_app_id === apiAppId),
+      );
       const online = onlineIds();
       for (const a of targets) {
         const ev = await appendEvent(a.id, 'slack_event', req.body.event);
@@ -269,7 +348,7 @@ router.post('/slack/events', async (req, res) => {
       // user isn't left staring at silence. The event is still logged and will
       // be replayed to the agent when it reconnects.
       if (targets.length && !targets.some((a) => online.has(a.id))) {
-        await notifyOfflineIfAddressed(teamId, targets, req.body.event);
+        await notifyOfflineIfAddressed(targets, req.body.event);
       }
     } catch (e) {
       // Already acked to Slack; log and move on so it isn't an unhandled rejection.
@@ -288,7 +367,7 @@ const _NOTIFY_IGNORED_SUBTYPES = new Set([
 // Post an "agent offline" notice to Slack when a message clearly addressed to
 // the bot arrives with no agent online to handle it. Best-effort and deduped
 // per thread per offline episode (see claimOfflineNotice).
-async function notifyOfflineIfAddressed(teamId, targets, event) {
+async function notifyOfflineIfAddressed(targets, event) {
   if (!event || typeof event !== 'object') return;
   if (event.bot_id || _NOTIFY_IGNORED_SUBTYPES.has(event.subtype)) return;
 
@@ -297,9 +376,10 @@ async function notifyOfflineIfAddressed(teamId, targets, event) {
   if (!channel || !ts) return;
   const threadTs = event.thread_ts || ts;
 
-  const agent = await getAgentByTeam(teamId);
+  // Post with THIS app's bot token (targets are already the agents for this app).
+  const agent = await getAgentById(targets[0].id);
   const token = agent && agent.slack_bot_token;
-  if (!token) return; // can't post without the workspace bot token
+  if (!token) return; // can't post without the app's bot token
 
   // Decide whether this event is actually aimed at the bot.
   const type = event.type;

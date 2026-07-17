@@ -43,23 +43,23 @@ export function verifySlackSignature({ signingSecret, signature, timestamp, rawB
 // User-level identity (not a bot install), used to authenticate a workspace
 // member for the dashboard. Same app credentials, different endpoints/scopes.
 
-export function oidcAuthorizeUrl(state, redirectUri) {
+export function oidcAuthorizeUrl(state, redirectUri, app = config.slack.primary) {
   const u = new URL('https://slack.com/openid/connect/authorize');
   u.searchParams.set('response_type', 'code');
   u.searchParams.set('scope', 'openid email profile');
-  u.searchParams.set('client_id', config.slack.clientId);
+  u.searchParams.set('client_id', app.clientId);
   u.searchParams.set('redirect_uri', redirectUri);
   u.searchParams.set('state', state);
   return u.toString();
 }
 
-export async function exchangeOidcCode(code, redirectUri) {
+export async function exchangeOidcCode(code, redirectUri, app = config.slack.primary) {
   const res = await fetch('https://slack.com/api/openid.connect.token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: config.slack.clientId,
-      client_secret: config.slack.clientSecret,
+      client_id: app.clientId,
+      client_secret: app.clientSecret,
       code,
       redirect_uri: redirectUri,
     }),
@@ -86,14 +86,15 @@ export function decodeIdToken(idToken) {
   }
 }
 
-// Exchange an OAuth `code` for a bot token (oauth.v2.access).
-export async function exchangeCode(code, redirectUri) {
+// Exchange an OAuth `code` for a bot token (oauth.v2.access). `app` selects which
+// configured Slack app's client credentials to use (multiple clones per workspace).
+export async function exchangeCode(code, redirectUri, app = config.slack.primary) {
   const res = await fetch('https://slack.com/api/oauth.v2.access', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id: config.slack.clientId,
-      client_secret: config.slack.clientSecret,
+      client_id: app.clientId,
+      client_secret: app.clientSecret,
       code,
       redirect_uri: redirectUri,
     }),
