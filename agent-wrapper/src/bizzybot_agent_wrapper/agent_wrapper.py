@@ -241,7 +241,8 @@ def build_session_manager() -> SessionManager:
     # each have to set it; disable explicitly with CLAUDE_CHROME=0.
     if _truthy(os.getenv("CLAUDE_CHROME", "1")):
         extra_args["chrome"] = None
-    cwd = os.getenv("CLAUDE_CWD") or os.path.expanduser("~")
+    # Default to the directory bizzybot was launched from; CLAUDE_CWD overrides.
+    cwd = os.getenv("CLAUDE_CWD") or os.getcwd()
     mcp_servers = (
         load_cli_mcp_servers(cwd) if _truthy(os.getenv("CLAUDE_LOAD_CLI_MCP", "1")) else {}
     )
