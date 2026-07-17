@@ -40,13 +40,15 @@ so it's usable by Claude.
 By default each agent uses whatever `claude` on that machine is authenticated
 with (an Anthropic API key or a Claude subscription). You can instead point an
 agent at [OpenRouter](https://openrouter.ai) and run it on any model OpenRouter
-serves.
+serves. OpenRouter supports tons of models, including ones you can use for
+*free* which still work pretty well with Claude Code. We have tested `tencent/hy3:free`
+and it worked pretty well!
 
 Create `~/.claudebot/settings.env` on the agent's machine and set both keys:
 
 ```bash
 OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
+OPENROUTER_MODEL=tencent/hy3:free
 ```
 
 Restart the agent-wrapper. It configures Claude Code to talk to OpenRouter's
