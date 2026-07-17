@@ -1,6 +1,8 @@
-# Claudebot
+# Bizzybot
 
 Integrate a Claude Code agent into your Slack workspace.
+
+<img width="657" alt="Bizzybot answering in a Slack thread" src="docs/bizzybot-slack.png" />
 
 ## Getting started
 
