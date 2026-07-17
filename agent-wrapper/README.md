@@ -58,6 +58,38 @@ On start it:
 3. Opens the **WebSocket** and replays anything it missed (via the last acked
    `seq` in `~/.claudebot/agent-wrapper-state.json`), then handles live events.
 
+## Agent settings file
+
+Per-agent settings live in `~/.claudebot/settings.env` (override the path with
+`CLAUDEBOT_SETTINGS_FILE`) — a dotenv-style file you edit by hand. Every key in
+it is passed through to each `claude` subprocess as an environment variable, so
+it's also the place for provider keys or other per-agent env. Real environment
+variables win over the file, and changes take effect on the next restart.
+
+### Using OpenRouter as the model provider
+
+Set both keys and the agent runs its Claude Code sessions against OpenRouter
+instead of Anthropic ([OpenRouter's Claude Code
+guide](https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration)):
+
+```bash
+# ~/.claudebot/settings.env
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
+```
+
+The agent-wrapper then points the subprocess at `https://openrouter.ai/api`,
+passes the key as `ANTHROPIC_AUTH_TOKEN`, blanks `ANTHROPIC_API_KEY` (an
+inherited Anthropic key would otherwise take precedence), and pins
+`OPENROUTER_MODEL` for the main session, subagents, and Claude Code's internal
+opus/sonnet/haiku tiers. `CLAUDE_MODEL` is ignored while OpenRouter is
+configured. Setting only one of the two keys is ignored with a warning.
+
+Any model on OpenRouter works, but tool-calling quality varies — start with an
+`anthropic/*` model. Note that Claude Code's own `/logout` state matters: if the
+`claude` CLI is signed in with an Anthropic account, run `claude /logout` once so
+it doesn't prefer those cached credentials over the OpenRouter token.
+
 ## Behaviour
 
 - Responds to **@-mentions** and **direct messages**.
@@ -82,3 +114,5 @@ Kept in `~/.claudebot/` (override with `CLAUDEBOT_STATE_DIR`):
   written on first-run prompt. Holds a secret; kept `0600`.
 - `agent-wrapper-state.json` — last acked event sequence.
 - `sessions.json` — per-thread Claude session ids (for resume across restarts).
+- `settings.env` — your agent settings (see above). Hand-edited, not written by
+  the agent-wrapper.

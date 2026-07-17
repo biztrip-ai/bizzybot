@@ -34,6 +34,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from .paths import state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
+from .settings import claude_env, load_settings
 from .slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
 
 load_dotenv()
@@ -242,16 +243,30 @@ def build_session_manager() -> SessionManager:
     mcp_servers = (
         load_cli_mcp_servers(cwd) if _truthy(os.getenv("CLAUDE_LOAD_CLI_MCP", "1")) else {}
     )
+    # The user's settings file (~/.claudebot/settings.env) — passed through to
+    # each claude subprocess, and the source of an alternate model provider.
+    env, provider_model = claude_env(load_settings())
+    model = os.getenv("CLAUDE_MODEL") or None
+    if provider_model:
+        # An Anthropic model id would 404 at OpenRouter, so the provider's model
+        # wins over a CLAUDE_MODEL left over from a previous setup.
+        if model and model != provider_model:
+            log.warning(
+                "CLAUDE_MODEL=%s ignored — OPENROUTER_MODEL=%s takes precedence",
+                model, provider_model,
+            )
+        model = provider_model
     return SessionManager(
         cwd=cwd,
         permission_mode=os.getenv("CLAUDE_PERMISSION_MODE", "bypassPermissions"),
-        model=os.getenv("CLAUDE_MODEL") or None,
+        model=model,
         setting_sources=_parse_sources(
             os.getenv("CLAUDE_SETTING_SOURCES", "user,project,local")
         ),
         extra_args=extra_args,
         system_prompt_append=SLACK_FORMATTING_PROMPT,
         mcp_servers=mcp_servers,
+        env=env,
         # Screenshots/images the agent Reads back arrive as one big base64 JSON
         # message; the SDK's 1MB default rejects them. 64MB by default.
         max_buffer_size=int(os.getenv("CLAUDE_MAX_BUFFER_SIZE", str(64 * 1024 * 1024))),

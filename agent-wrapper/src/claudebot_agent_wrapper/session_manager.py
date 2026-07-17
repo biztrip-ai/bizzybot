@@ -361,6 +361,7 @@ class SessionManager:
         extra_args: Optional[dict[str, Optional[str]]] = None,
         system_prompt_append: Optional[str] = None,
         mcp_servers: Optional[dict[str, dict]] = None,
+        env: Optional[dict[str, str]] = None,
         max_buffer_size: Optional[int] = None,
         idle_timeout_s: Optional[float] = None,
         reap_interval_s: float = 300.0,
@@ -371,6 +372,9 @@ class SessionManager:
         self._setting_sources = setting_sources
         self._extra_args = extra_args or {}
         self._mcp_servers = mcp_servers or {}
+        # Extra environment for each claude subprocess (user settings file, and
+        # the provider vars derived from it).
+        self._env = env or {}
         self._system_prompt_append = system_prompt_append
         # Each session pins a ~80-130MB claude subprocess. If set, a background
         # reaper closes sessions idle longer than this many seconds. The
@@ -430,6 +434,8 @@ class SessionManager:
             kwargs["setting_sources"] = self._setting_sources
         if self._mcp_servers:
             kwargs["mcp_servers"] = self._mcp_servers
+        if self._env:
+            kwargs["env"] = dict(self._env)
         if self._max_buffer_size:
             kwargs["max_buffer_size"] = self._max_buffer_size
         if self._extra_args:
