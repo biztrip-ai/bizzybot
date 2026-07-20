@@ -16,6 +16,14 @@ import {
 // discarded on connect and by a periodic sweep. Override with STALE_EVENT_MAX_AGE_MS.
 const STALE_EVENT_MAX_AGE_MS = Number(process.env.STALE_EVENT_MAX_AGE_MS || 10 * 60 * 1000);
 
+// Server-initiated keepalive. Without this, Railway's proxy silently closes an
+// idle WebSocket after its own timeout (~10 min) and a half-open (dead-but-not-
+// FIN'd) socket looks OPEN to us, so pushEvent writes live events into the void.
+// We ping every interval and terminate any socket that didn't pong since the
+// last one — which also frees the agent to reconnect and replay. Override with
+// WS_PING_INTERVAL_MS.
+const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 30 * 1000);
+
 const connections = new Map(); // agentId -> { ws, ready, queue }
 
 // Agent ids with a live WebSocket right now (in-memory; single instance).
@@ -68,6 +76,32 @@ export function attachWsHub(server) {
   }, sweepEvery);
   sweep.unref?.();
 
+  // Keepalive heartbeat: ping every connection, and terminate any that failed to
+  // pong since the previous tick (a dead peer). `isAlive` is reset to true on
+  // each pong (handler set at connection time). ws also auto-replies to the
+  // client's pings, so this keeps traffic flowing both ways past the proxy.
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        ws.terminate();
+        continue;
+      }
+      ws.isAlive = false;
+      try {
+        ws.ping();
+      } catch {
+        // ping can throw if the socket died between the check and here; the next
+        // tick will terminate it.
+      }
+    }
+  }, WS_PING_INTERVAL_MS);
+  heartbeat.unref?.();
+
+  wss.on('close', () => {
+    clearInterval(sweep);
+    clearInterval(heartbeat);
+  });
+
   wss.on('connection', async (ws, req) => {
     const url = new URL(req.url, 'http://localhost');
     const token = url.searchParams.get('token');
@@ -99,6 +133,13 @@ export function attachWsHub(server) {
     offlineNotified.delete(agent.id); // fresh episode: allow notices again
     touchAgentSeen(agent.id).catch(() => {});
     console.log(`[ws] agent ${agent.id} connected (lastSeq=${lastSeq})`);
+
+    // Keepalive: healthy on connect; every client pong re-arms it. The heartbeat
+    // interval terminates any socket still marked dead at the next tick.
+    ws.isAlive = true;
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
 
     ws.on('message', (data) => {
       let msg;
