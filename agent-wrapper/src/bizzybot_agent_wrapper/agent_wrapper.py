@@ -9,9 +9,10 @@ Runs in the agent workspace (a laptop, VM, or container — set up by hand). It:
   4. drives one persistent Claude Code session per Slack thread and posts the
      replies straight back to Slack.
 
-No Ably, no cloud provisioning, no idle keep-alive. Uses your own local git/gh
-auth. Installed as the `bizzybot` command (see pyproject [project.scripts]);
-run from source with `uv run bizzybot`.
+No Ably, no cloud provisioning. On macOS it runs `caffeinate` so an idle laptop
+doesn't sleep and drop the connection (see _prevent_sleep_on_macos). Uses your
+own local git/gh auth. Installed as the `bizzybot` command (see pyproject
+[project.scripts]); run from source with `uv run bizzybot`.
 """
 
 from __future__ import annotations
@@ -767,8 +768,38 @@ async def main() -> None:
             await sessions.close_all()
 
 
+def _prevent_sleep_on_macos() -> None:
+    """Keep the Mac awake while the wrapper runs so an idle laptop doesn't sleep
+    and drop the WebSocket to Central-Dispatch.
+
+    Spawns `caffeinate -i -w <pid>` as a detached child: `-i` prevents idle system
+    sleep, `-s` also prevents system sleep on AC power, and `-w <pid>` ties it to
+    our process — caffeinate exits on its own when we exit, so there's nothing to
+    clean up and no orphan. No-op off macOS, if caffeinate isn't found, or if
+    BIZZYBOT_NO_CAFFEINATE is set. Note caffeinate can't override lid-close sleep
+    on battery — for that, use a launchd agent + pmset.
+    """
+    if sys.platform != "darwin" or os.getenv("BIZZYBOT_NO_CAFFEINATE"):
+        return
+    caffeinate = shutil.which("caffeinate")
+    if not caffeinate:
+        log.warning("caffeinate not found; the Mac may sleep and drop the connection")
+        return
+    try:
+        subprocess.Popen(
+            [caffeinate, "-i", "-s", "-w", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("caffeinate: preventing idle sleep while bizzybot runs")
+    except Exception as e:  # never let keep-awake stop the wrapper from starting
+        log.warning("could not start caffeinate (%s); the Mac may sleep", e)
+
+
 def main_sync() -> None:
     """Console-script entry point (`bizzybot`). Sync wrapper around main()."""
+    _prevent_sleep_on_macos()
     asyncio.run(main())
 
 
