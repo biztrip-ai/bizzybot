@@ -450,6 +450,97 @@ async def handle_user_message(
         await _send_email_reply(email_ctx, joined, channel, reply_ts, slack)
 
 
+# --- Background-task flush --------------------------------------------------
+
+# The Agent SDK is strictly turn-based: once a turn's result arrives, nothing
+# can reach Slack until the next message. A background sub-agent that outlives
+# its turn would finish silently — its results only surfacing whenever the user
+# happens to write again. The SubagentStop hook (wired per session in
+# SessionManager) fires even while a session is idle; we answer it by running a
+# synthetic "flush" turn in which the agent sees the pending task notifications
+# and reports the finished work to the thread.
+
+# Wait after a SubagentStop before flushing, so a burst of sub-agents finishing
+# together is reported by one turn instead of several.
+FLUSH_COALESCE_S = 5.0
+
+FLUSH_SENTINEL = "NOTHING_TO_REPORT"
+
+FLUSH_PROMPT = (
+    "[Automated wake-up — not a user message. One or more background tasks or "
+    "sub-agents in this thread just finished. Report their results to the "
+    "thread now, exactly as you would have if you had been waiting for them. "
+    "If every finished task's outcome has already been reported and there is "
+    f"nothing new to say, reply with exactly {FLUSH_SENTINEL}.]"
+)
+
+
+async def flush_background_results(
+    thread_key: str,
+    sessions: SessionManager,
+    slack: AsyncWebClient,
+    on_turn_start: Optional[Callable[[], None]] = None,
+) -> None:
+    """Run a synthetic turn that reports finished background work to the thread.
+
+    Posts nothing at all when the agent answers with the sentinel (already
+    reported, or the notification landed in an intervening turn), so redundant
+    flushes stay invisible on Slack. `on_turn_start` fires once the turn holds
+    the session lock, which is the point after which a sub-agent that stops can
+    no longer appear in this turn's output."""
+    session = sessions.get(thread_key)
+    if session is None:
+        return  # cleared/reaped since the hook fired — don't resurrect it
+    channel, _, reply_ts = thread_key.partition(":")
+    log.info("flush: reporting background results on %s", thread_key)
+    renderer = SlackRenderer(slack, channel, reply_ts)
+    opened = False  # renderer.open() deferred until there's something to say
+    full_text: list[str] = []
+    error: Optional[str] = None
+    try:
+        async for chunk in session.send(FLUSH_PROMPT):
+            if chunk.kind == "turn_start":
+                if on_turn_start is not None:
+                    on_turn_start()
+            elif chunk.kind == "text":
+                if not opened:
+                    if chunk.text.strip() in ("", FLUSH_SENTINEL):
+                        continue
+                    await renderer.open()
+                    opened = True
+                full_text.append(chunk.text)
+                await renderer.append(ATTACH_RE.sub("", chunk.text))
+            elif chunk.kind == "tool_use" and opened:
+                await renderer.status(tool_label(chunk.name, chunk.args))
+            elif chunk.kind == "result" and chunk.is_error:
+                # A failed turn arrives as a result chunk rather than an
+                # exception, so without this it streams no text and is
+                # indistinguishable from the sentinel.
+                error = chunk.text
+    except Exception as e:  # noqa: BLE001
+        log.exception("flush turn failed on %s", thread_key)
+        error = str(e)
+
+    if error is not None:
+        # Never go quiet on a failed flush: the sub-agent has already stopped,
+        # so no further hook fires for it and nothing else would ever report it.
+        log.warning("flush: turn failed on %s: %s", thread_key, error)
+        if not opened:
+            await renderer.open()
+        await renderer.replace_with(
+            f":warning: a background task finished but reporting it failed: `{error}`"
+        )
+        return
+    if not opened:
+        log.info("flush: nothing to report on %s", thread_key)
+        return
+    await renderer.flush(force=True)
+
+    paths = [m.group(1).strip() for m in ATTACH_RE.finditer("\n".join(full_text))]
+    if paths:
+        await upload_files(slack, channel, reply_ts, paths)
+
+
 async def _send_email_reply(
     ctx: dict, turn_text: str, channel: str, reply_ts: str, slack: AsyncWebClient
 ) -> None:
@@ -743,6 +834,46 @@ async def main() -> None:
         sessions = build_session_manager()
         sessions.start_reaper()
         slack = AsyncWebClient(token=slack_token)
+
+        # Wake threads when a background sub-agent finishes (see the
+        # "Background-task flush" section above). thread_key -> the task holding
+        # that thread's coalescing window, so a window that closes never clears
+        # a newer one.
+        flush_pending: dict[str, asyncio.Task] = {}
+        flush_tasks: set[asyncio.Task] = set()
+
+        def on_subagent_stop(thread_key: str) -> None:
+            # Deliberately no `is_busy` check. A sub-agent that stops late in a
+            # running turn — after the agent already composed its answer — is
+            # absent from that turn's output, so skipping it here would strand
+            # it for good. Scheduling regardless costs at most one extra turn,
+            # which the sentinel keeps invisible.
+            if sessions.get(thread_key) is None or thread_key in flush_pending:
+                return
+
+            async def _flush_later() -> None:
+                try:
+                    await asyncio.sleep(FLUSH_COALESCE_S)
+                    # The window closes when the turn takes the session lock,
+                    # not before: everything that stopped up to that point is
+                    # covered by this turn, and anything stopping after it opens
+                    # a fresh window rather than being swallowed.
+                    await flush_background_results(
+                        thread_key, sessions, slack, on_turn_start=_close_window
+                    )
+                finally:
+                    _close_window()  # cancelled, or the session was reaped
+
+            def _close_window() -> None:
+                if flush_pending.get(thread_key) is task:
+                    del flush_pending[thread_key]
+
+            task = asyncio.create_task(_flush_later())
+            flush_pending[thread_key] = task
+            flush_tasks.add(task)
+            task.add_done_callback(flush_tasks.discard)
+
+        sessions.on_subagent_stop = on_subagent_stop
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

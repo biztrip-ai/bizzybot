@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import AsyncIterator, Callable, Optional
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -110,7 +110,9 @@ class Chunk:
 
     The optional `name` / `args` / `is_error` fields are populated for
     `tool_use` and `tool_result` chunks so consumers can format short-form
-    summaries without re-parsing `text`.
+    summaries without re-parsing `text`. `is_error` is also set on the `result`
+    chunk when the turn itself failed — the SDK reports that as a message, not
+    an exception, so it is the only way to tell a failed turn from a quiet one.
     """
 
     kind: str
@@ -298,7 +300,7 @@ class Session:
                     if usage is not None:
                         parts.append(f"usage={usage}")
                     self._last_used_at = time.monotonic()
-                    yield Chunk("result", " ".join(parts))
+                    yield Chunk("result", " ".join(parts), is_error=bool(is_err))
                     return
 
     async def close(self) -> None:
@@ -391,6 +393,12 @@ class SessionManager:
         self._max_buffer_size = max_buffer_size
         self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
+        # Called with the thread key whenever a sub-agent in that thread stops
+        # (the CLI's SubagentStop hook). Fires even while the session is idle
+        # between turns — the only signal we get when a background sub-agent
+        # finishes after the turn that launched it already ended. Set by the
+        # wrapper after construction; must be a plain sync callable.
+        self.on_subagent_stop: Optional[Callable[[str], None]] = None
         # thread_key -> claude session_id, loaded from the /workspaces volume so a
         # restarted agent-wrapper can resume each thread's conversation.
         self._resume_ids: dict[str, str] = self._load_store()
@@ -421,10 +429,30 @@ class SessionManager:
         self._save_store()
         log.info("session map: %s -> %s", key, sid)
 
-    def _build_options(self, resume: Optional[str] = None) -> ClaudeAgentOptions:
+    def _make_subagent_stop_hook(self, key: str):
+        """A SubagentStop hook callback bound to one thread key. The SDK's
+        reader task dispatches hook callbacks over the control channel
+        independently of turn iteration, so this runs even when no turn is in
+        flight."""
+
+        async def _on_subagent_stop(input_data, tool_use_id, context) -> dict:
+            cb = self.on_subagent_stop
+            if cb is not None:
+                try:
+                    cb(key)
+                except Exception:  # noqa: BLE001 — a bad callback mustn't fail the hook
+                    log.exception("on_subagent_stop callback failed for %s", key)
+            return {}
+
+        return _on_subagent_stop
+
+    def _build_options(self, key: str, resume: Optional[str] = None) -> ClaudeAgentOptions:
         kwargs: dict = {
             "cwd": self._cwd,
             "permission_mode": self._permission_mode,
+            "hooks": {
+                "SubagentStop": [HookMatcher(hooks=[self._make_subagent_stop_hook(key)])]
+            },
         }
         if resume:
             kwargs["resume"] = resume
@@ -457,7 +485,7 @@ class SessionManager:
                     log.info("resuming thread %s from session %s", key, resume_id)
                 session = Session(
                     key,
-                    self._build_options(resume=resume_id),
+                    self._build_options(key, resume=resume_id),
                     resumed=bool(resume_id),
                     on_session_id=self._remember_session_id,
                 )
