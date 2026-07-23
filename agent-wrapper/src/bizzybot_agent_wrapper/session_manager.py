@@ -110,7 +110,9 @@ class Chunk:
 
     The optional `name` / `args` / `is_error` fields are populated for
     `tool_use` and `tool_result` chunks so consumers can format short-form
-    summaries without re-parsing `text`.
+    summaries without re-parsing `text`. `is_error` is also set on the `result`
+    chunk when the turn itself failed — the SDK reports that as a message, not
+    an exception, so it is the only way to tell a failed turn from a quiet one.
     """
 
     kind: str
@@ -298,7 +300,7 @@ class Session:
                     if usage is not None:
                         parts.append(f"usage={usage}")
                     self._last_used_at = time.monotonic()
-                    yield Chunk("result", " ".join(parts))
+                    yield Chunk("result", " ".join(parts), is_error=bool(is_err))
                     return
 
     async def close(self) -> None:
