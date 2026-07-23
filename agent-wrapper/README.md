@@ -98,6 +98,12 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   thread's session), `!help`.
 - **Serialized turns:** a second message in a thread whose turn is still running
   waits behind it, showing a *"⏳ queued…"* placeholder until it starts.
+- **Background sub-agent flush:** if the agent launches background sub-agents
+  and ends its turn, their finishing (the `SubagentStop` hook) wakes the idle
+  session and an automatic turn posts the results to the thread — no user
+  message needed. A flush with nothing new to say posts nothing. Background
+  *shell* tasks have no equivalent hook and still surface only on the next
+  message.
 - **Idle-session eviction:** each thread pins an ~80–130 MB `claude` subprocess.
   A background reaper closes sessions idle longer than `SESSION_IDLE_TIMEOUT_S`
   (default `14400` = 4h; `0` disables), scanning every `SESSION_REAP_INTERVAL_S`
