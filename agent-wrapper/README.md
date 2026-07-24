@@ -104,6 +104,14 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   message needed. A flush with nothing new to say posts nothing. Background
   *shell* tasks have no equivalent hook and still surface only on the next
   message.
+- **Shared working directory:** every thread runs in the same `CLAUDE_CWD`, and
+  turns in different threads run concurrently, so two threads editing the same
+  checkout would collide (and one switching branches would strand the other's
+  work). The appended system prompt tells the agent to `git worktree add` its own
+  tree before editing code, to remove it once the changes are committed, and to
+  kill any dev server it started. This is advisory — the model follows the
+  instruction; nothing enforces it. For a hard guarantee, run one agent-wrapper
+  per checkout (separate `CLAUDE_CWD` *and* `BIZZYBOT_STATE_DIR`).
 - **Idle-session eviction:** each thread pins an ~80–130 MB `claude` subprocess.
   A background reaper closes sessions idle longer than `SESSION_IDLE_TIMEOUT_S`
   (default `14400` = 4h; `0` disables), scanning every `SESSION_REAP_INTERVAL_S`

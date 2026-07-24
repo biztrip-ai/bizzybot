@@ -69,6 +69,29 @@ and put its absolute path on its own line prefixed with `ATTACH:`, e.g.:
 Emit one ATTACH line per file. The file is uploaded to this thread; the ATTACH
 line itself is removed from your message, so write a normal sentence too."""
 
+# Every thread runs in the same cwd (see build_session_manager), concurrently, so
+# the agent has to isolate its own edits and clean up what it starts. Advisory —
+# nothing enforces it.
+WORKSPACE_PROMPT = """\
+Every Slack thread shares ONE working directory, and other threads may be active in
+it at the same time — you don't have exclusive control of it. In a git repo, never
+switch branches in the shared tree; another thread's edits would land on your branch.
+
+So before you edit code, give yourself an isolated tree:
+  git worktree add ../<short-name> -b <branch>
+cd into it and do all of this thread's work there, reusing that one worktree on
+later turns instead of creating another. Reading and inspecting the shared tree is
+fine — only edits need a worktree.
+
+Tear both down when you're finished:
+- Once your changes are committed (and pushed, if you're pushing), `cd` out and
+  `git worktree remove <path>` — don't leave the worktree lying around. If you
+  abandon the work instead, remove it too.
+- Kill every dev server, file watcher, or other background process you started to
+  test something. They outlive your turn and hold their ports otherwise.
+
+Do this before you report back, and say what you cleaned up."""
+
 
 def _truthy(v: str | None) -> bool:
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
@@ -269,7 +292,7 @@ def build_session_manager() -> SessionManager:
             os.getenv("CLAUDE_SETTING_SOURCES", "user,project,local")
         ),
         extra_args=extra_args,
-        system_prompt_append=SLACK_FORMATTING_PROMPT,
+        system_prompt_append=f"{SLACK_FORMATTING_PROMPT}\n\n{WORKSPACE_PROMPT}",
         mcp_servers=mcp_servers,
         env=env,
         # Screenshots/images the agent Reads back arrive as one big base64 JSON
