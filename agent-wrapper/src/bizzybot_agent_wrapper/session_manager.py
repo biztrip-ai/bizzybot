@@ -210,98 +210,143 @@ class Session:
                 turn, len(prompt), _truncate(prompt, 200),
             )
             await self._client.query(prompt)
-            async for msg in self._client.receive_response():
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            self.log.info(
-                                "turn %d: assistant text (%d chars): %r",
-                                turn, len(block.text), _truncate(block.text, 200),
-                            )
-                            self.log.debug("turn %d: full text: %s", turn, block.text)
-                            yield Chunk("text", block.text)
-                        elif isinstance(block, ToolUseBlock):
-                            self.log.info(
-                                "turn %d: tool_use %s id=%s args=%s",
-                                turn, block.name, block.id,
-                                _truncate(repr(block.input or {}), 400),
-                            )
-                            yield Chunk(
-                                "tool_use",
-                                _format_tool_use_full(block),
-                                name=block.name,
-                                args=dict(block.input or {}),
-                            )
-                        elif isinstance(block, ThinkingBlock):
-                            self.log.debug(
-                                "turn %d: thinking (%d chars): %s",
-                                turn, len(block.thinking),
-                                _truncate(block.thinking, 500),
-                            )
-                elif isinstance(msg, UserMessage):
-                    for block in msg.content:
-                        if isinstance(block, ToolResultBlock):
-                            content = block.content
-                            if isinstance(content, list):
-                                content_str = " ".join(
-                                    getattr(c, "text", repr(c)) for c in content
+            # `receive_response()` reads the CLI's shared message stream up to the
+            # next ResultMessage — nothing in it ties a message back to the query
+            # that produced it. Pairing rests entirely on each turn consuming its
+            # own messages to the end: anything left behind is read by the *next*
+            # turn as its own answer, silently shifting every later reply onto the
+            # wrong prompt for the rest of the session. Our consumer can vanish at
+            # any yield below (an exception in its loop body closes this
+            # generator), so the drain runs from a finally, before the lock is
+            # released.
+            stream = self._client.receive_response()
+            complete = False
+            try:
+                async for msg in stream:
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                self.log.info(
+                                    "turn %d: assistant text (%d chars): %r",
+                                    turn, len(block.text), _truncate(block.text, 200),
                                 )
-                            else:
-                                content_str = str(content)
-                            level = (
-                                logging.WARNING if block.is_error else logging.INFO
-                            )
-                            self.log.log(
-                                level,
-                                "turn %d: tool_result id=%s is_error=%s "
-                                "(%d chars): %r",
-                                turn, block.tool_use_id, block.is_error,
-                                len(content_str), _truncate(content_str, 200),
-                            )
-                            self.log.debug(
-                                "turn %d: tool_result full: %s", turn, content_str,
-                            )
-                            yield Chunk(
-                                "tool_result",
-                                _format_tool_result(
-                                    block.tool_use_id, block.is_error, content_str
-                                ),
-                                is_error=bool(block.is_error),
-                            )
-                elif isinstance(msg, SystemMessage):
+                                self.log.debug("turn %d: full text: %s", turn, block.text)
+                                yield Chunk("text", block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                self.log.info(
+                                    "turn %d: tool_use %s id=%s args=%s",
+                                    turn, block.name, block.id,
+                                    _truncate(repr(block.input or {}), 400),
+                                )
+                                yield Chunk(
+                                    "tool_use",
+                                    _format_tool_use_full(block),
+                                    name=block.name,
+                                    args=dict(block.input or {}),
+                                )
+                            elif isinstance(block, ThinkingBlock):
+                                self.log.debug(
+                                    "turn %d: thinking (%d chars): %s",
+                                    turn, len(block.thinking),
+                                    _truncate(block.thinking, 500),
+                                )
+                    elif isinstance(msg, UserMessage):
+                        for block in msg.content:
+                            if isinstance(block, ToolResultBlock):
+                                content = block.content
+                                if isinstance(content, list):
+                                    content_str = " ".join(
+                                        getattr(c, "text", repr(c)) for c in content
+                                    )
+                                else:
+                                    content_str = str(content)
+                                level = (
+                                    logging.WARNING if block.is_error else logging.INFO
+                                )
+                                self.log.log(
+                                    level,
+                                    "turn %d: tool_result id=%s is_error=%s "
+                                    "(%d chars): %r",
+                                    turn, block.tool_use_id, block.is_error,
+                                    len(content_str), _truncate(content_str, 200),
+                                )
+                                self.log.debug(
+                                    "turn %d: tool_result full: %s", turn, content_str,
+                                )
+                                yield Chunk(
+                                    "tool_result",
+                                    _format_tool_result(
+                                        block.tool_use_id, block.is_error, content_str
+                                    ),
+                                    is_error=bool(block.is_error),
+                                )
+                    elif isinstance(msg, SystemMessage):
+                        data = getattr(msg, "data", {}) or {}
+                        # The init message carries the session id — capture it early
+                        # so even a mid-turn shutdown leaves a resumable id on disk.
+                        self._capture_session_id(data.get("session_id"))
+                        self.log.debug(
+                            "turn %d: system subtype=%s data=%s",
+                            turn, getattr(msg, "subtype", "?"),
+                            _truncate(repr(data), 300),
+                        )
+                    elif isinstance(msg, ResultMessage):
+                        self._capture_session_id(getattr(msg, "session_id", None))
+                        is_err = getattr(msg, "is_error", False)
+                        duration = getattr(msg, "duration_ms", None)
+                        cost = getattr(msg, "total_cost_usd", None)
+                        usage = getattr(msg, "usage", None)
+                        self.log.info(
+                            "turn %d: result is_error=%s duration_ms=%s cost_usd=%s "
+                            "usage=%s",
+                            turn, is_err, duration, cost,
+                            _truncate(repr(usage), 200) if usage else None,
+                        )
+                        parts: list[str] = []
+                        if is_err:
+                            parts.append(f"ERROR: {getattr(msg, 'result', '')}")
+                        if duration is not None:
+                            parts.append(f"duration={duration}ms")
+                        if cost is not None:
+                            parts.append(f"cost=${cost}")
+                        if usage is not None:
+                            parts.append(f"usage={usage}")
+                        self._last_used_at = time.monotonic()
+                        complete = True
+                        yield Chunk("result", " ".join(parts), is_error=bool(is_err))
+                        return
+            finally:
+                if not complete:
+                    await self._drain(stream, turn)
+
+    async def _drain(self, stream: AsyncIterator, turn: int) -> None:
+        """Consume the rest of a turn's messages after our consumer went away.
+
+        Reaching here means something aborted the turn early — a Slack failure
+        while rendering, a cancelled task — so it's logged loudly rather than
+        swallowed. Draining is what keeps the next turn reading its own answer
+        instead of this one's leftovers."""
+        count = 0
+        try:
+            async for msg in stream:
+                count += 1
+                if isinstance(msg, SystemMessage):
                     data = getattr(msg, "data", {}) or {}
-                    # The init message carries the session id — capture it early
-                    # so even a mid-turn shutdown leaves a resumable id on disk.
                     self._capture_session_id(data.get("session_id"))
-                    self.log.debug(
-                        "turn %d: system subtype=%s data=%s",
-                        turn, getattr(msg, "subtype", "?"),
-                        _truncate(repr(data), 300),
-                    )
                 elif isinstance(msg, ResultMessage):
                     self._capture_session_id(getattr(msg, "session_id", None))
-                    is_err = getattr(msg, "is_error", False)
-                    duration = getattr(msg, "duration_ms", None)
-                    cost = getattr(msg, "total_cost_usd", None)
-                    usage = getattr(msg, "usage", None)
-                    self.log.info(
-                        "turn %d: result is_error=%s duration_ms=%s cost_usd=%s "
-                        "usage=%s",
-                        turn, is_err, duration, cost,
-                        _truncate(repr(usage), 200) if usage else None,
-                    )
-                    parts: list[str] = []
-                    if is_err:
-                        parts.append(f"ERROR: {getattr(msg, 'result', '')}")
-                    if duration is not None:
-                        parts.append(f"duration={duration}ms")
-                    if cost is not None:
-                        parts.append(f"cost=${cost}")
-                    if usage is not None:
-                        parts.append(f"usage={usage}")
                     self._last_used_at = time.monotonic()
-                    yield Chunk("result", " ".join(parts), is_error=bool(is_err))
-                    return
+        except Exception:  # noqa: BLE001
+            self.log.exception(
+                "turn %d: drain failed after %d message(s) — this session's "
+                "queries and responses may now be out of sync", turn, count,
+            )
+            return
+        if count:
+            self.log.warning(
+                "turn %d: consumer went away mid-turn; drained %d leftover "
+                "message(s) to keep the stream aligned", turn, count,
+            )
 
     async def close(self) -> None:
         if self._connected:

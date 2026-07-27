@@ -95,9 +95,18 @@ class SlackRenderer:
         await self._push(force=True)
 
     async def open(self) -> None:
-        resp = await self._client.chat_postMessage(
-            channel=self._channel, thread_ts=self._thread_ts, text=self._placeholder
-        )
+        # A Slack failure must never escape the renderer: callers run this from
+        # inside the loop consuming a turn's message stream, and an exception
+        # there abandons the stream mid-turn, which permanently desyncs every
+        # later turn's output (see Session.send). Failing to post just means we
+        # render nothing — `_ts is None` makes every later write a no-op.
+        try:
+            resp = await self._client.chat_postMessage(
+                channel=self._channel, thread_ts=self._thread_ts, text=self._placeholder
+            )
+        except SlackApiError as e:
+            log.warning("chat_postMessage (open) failed; rendering nothing: %s", e)
+            return
         self._ts = resp["ts"]
 
     def _render(self) -> str:
@@ -165,10 +174,18 @@ class SlackRenderer:
             log.warning("chat_update failed: %s", e)
 
     async def _roll_over(self) -> None:
-        resp = await self._client.chat_postMessage(
-            channel=self._channel, thread_ts=self._thread_ts, text="…"
-        )
-        self._ts = resp["ts"]
+        # Same rule as open(): never raise into the turn's stream consumer. If the
+        # continuation message can't be posted, stop rendering (`_ts = None`)
+        # rather than overwriting the message we just filled with the next slice.
+        try:
+            resp = await self._client.chat_postMessage(
+                channel=self._channel, thread_ts=self._thread_ts, text="…"
+            )
+        except SlackApiError as e:
+            log.warning("chat_postMessage (roll-over) failed; dropping the rest: %s", e)
+            self._ts = None
+        else:
+            self._ts = resp["ts"]
         self._body = ""
         self._last_flushed_len = 0
         self._last_flush_at = 0.0
