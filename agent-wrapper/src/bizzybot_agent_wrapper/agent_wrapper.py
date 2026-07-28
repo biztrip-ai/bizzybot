@@ -506,8 +506,10 @@ async def flush_background_results(
                 if not opened:
                     if chunk.text.strip() in ("", FLUSH_SENTINEL):
                         continue
-                    await renderer.open()
-                    opened = True
+                    # open() reports whether it posted; if Slack refused, leave
+                    # `opened` False so the error path below still tries — going
+                    # quiet here would strand the finished sub-agent for good.
+                    opened = await renderer.open()
                 full_text.append(chunk.text)
                 await renderer.append(ATTACH_RE.sub("", chunk.text))
             elif chunk.kind == "tool_use" and opened:

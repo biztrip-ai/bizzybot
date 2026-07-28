@@ -209,7 +209,6 @@ class Session:
                 "turn %d: user prompt (%d chars): %r",
                 turn, len(prompt), _truncate(prompt, 200),
             )
-            await self._client.query(prompt)
             # `receive_response()` reads the CLI's shared message stream up to the
             # next ResultMessage — nothing in it ties a message back to the query
             # that produced it. Pairing rests entirely on each turn consuming its
@@ -219,9 +218,15 @@ class Session:
             # any yield below (an exception in its loop body closes this
             # generator), so the drain runs from a finally, before the lock is
             # released.
+            #
+            # query() is inside the try: once the prompt reaches the CLI's stdin
+            # the turn exists and will produce messages, so from that await
+            # onwards there is always something to drain.
             stream = self._client.receive_response()
-            complete = False
+            complete = False   # saw our ResultMessage — nothing left to drain
+            exhausted = False  # stream ended on its own — nothing left to drain
             try:
+                await self._client.query(prompt)
                 async for msg in stream:
                     if isinstance(msg, AssistantMessage):
                         for block in msg.content:
@@ -315,8 +320,9 @@ class Session:
                         complete = True
                         yield Chunk("result", " ".join(parts), is_error=bool(is_err))
                         return
+                exhausted = True
             finally:
-                if not complete:
+                if not complete and not exhausted:
                     await self._drain(stream, turn)
 
     async def _drain(self, stream: AsyncIterator, turn: int) -> None:
@@ -325,8 +331,15 @@ class Session:
         Reaching here means something aborted the turn early — a Slack failure
         while rendering, a cancelled task — so it's logged loudly rather than
         swallowed. Draining is what keeps the next turn reading its own answer
-        instead of this one's leftovers."""
+        instead of this one's leftovers.
+
+        Reaching the ResultMessage is what makes the stream safe again. If we
+        can't (the stream was closed under us, which is what a cancellation
+        delivered inside `stream.__anext__()` does), the leftovers survive and
+        the next turn will read them — so that case is logged at ERROR rather
+        than passing quietly as a zero-length drain."""
         count = 0
+        saw_result = False
         try:
             async for msg in stream:
                 count += 1
@@ -334,6 +347,7 @@ class Session:
                     data = getattr(msg, "data", {}) or {}
                     self._capture_session_id(data.get("session_id"))
                 elif isinstance(msg, ResultMessage):
+                    saw_result = True
                     self._capture_session_id(getattr(msg, "session_id", None))
                     self._last_used_at = time.monotonic()
         except Exception:  # noqa: BLE001
@@ -342,10 +356,17 @@ class Session:
                 "queries and responses may now be out of sync", turn, count,
             )
             return
-        if count:
+        if saw_result:
             self.log.warning(
                 "turn %d: consumer went away mid-turn; drained %d leftover "
                 "message(s) to keep the stream aligned", turn, count,
+            )
+        else:
+            self.log.error(
+                "turn %d: could not drain to the end of the turn (stream closed "
+                "after %d message(s)) — later turns on this session may read "
+                "this turn's leftovers as their own answer; !clear to reset it",
+                turn, count,
             )
 
     async def close(self) -> None:

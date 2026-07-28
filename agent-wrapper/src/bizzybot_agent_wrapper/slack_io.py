@@ -17,7 +17,6 @@ from typing import Any, Optional
 
 import aiohttp
 from slack_sdk.web.async_client import AsyncWebClient
-from slack_sdk.errors import SlackApiError
 
 log = logging.getLogger("agent-wrapper.slack")
 
@@ -81,6 +80,12 @@ class SlackRenderer:
         # Latest tool activity ("📄 Read foo.py"), shown while the agent works so
         # a long tool run isn't dead air. Cleared when real text resumes.
         self._status = ""
+        # Set once posting a message fails. Sticky and one-way: a renderer that
+        # can't post a message can't render the rest of the answer in order, and
+        # retrying would silently drop the slice it failed on and resume from the
+        # next one — a hole in the middle of the reply with nothing marking it.
+        # Whatever posted successfully stays; the rest is dropped and logged.
+        self._broken = False
 
     async def mark_active(self) -> None:
         """The turn just started (we hold the session lock now). If we're still
@@ -94,20 +99,24 @@ class SlackRenderer:
         self._placeholder = f"_{random.choice(THINKING_PHRASES)}_"
         await self._push(force=True)
 
-    async def open(self) -> None:
-        # A Slack failure must never escape the renderer: callers run this from
-        # inside the loop consuming a turn's message stream, and an exception
-        # there abandons the stream mid-turn, which permanently desyncs every
-        # later turn's output (see Session.send). Failing to post just means we
-        # render nothing — `_ts is None` makes every later write a no-op.
+    async def open(self) -> bool:
+        # Nothing this renderer does may escape into the caller: callers run it
+        # from inside the loop consuming a turn's message stream, and an
+        # exception there abandons the stream mid-turn, which desyncs every later
+        # turn's output (see Session.send). Catch Exception, not just
+        # SlackApiError — slack_sdk re-raises transport errors (aiohttp
+        # ClientConnectorError, asyncio.TimeoutError) unwrapped once retries are
+        # exhausted. Returns whether the message was posted.
         try:
             resp = await self._client.chat_postMessage(
                 channel=self._channel, thread_ts=self._thread_ts, text=self._placeholder
             )
-        except SlackApiError as e:
+        except Exception as e:  # noqa: BLE001
             log.warning("chat_postMessage (open) failed; rendering nothing: %s", e)
-            return
+            self._broken = True
+            return False
         self._ts = resp["ts"]
+        return True
 
     def _render(self) -> str:
         body = self._body.strip()
@@ -116,12 +125,14 @@ class SlackRenderer:
         return body or self._placeholder
 
     async def append(self, text: str) -> None:
-        if not text:
+        if not text or self._broken:
             return
         self._status = ""
         # Spread `text` across as many messages as needed so no single Slack
         # message exceeds MAX_MSG_CHARS (a whole reply can arrive in one chunk).
-        while text:
+        # Stops on `_broken`: continuing past a failed roll-over would drop the
+        # slice in flight and carry on with the next one.
+        while text and not self._broken:
             capacity = MAX_MSG_CHARS - len(self._body)
             if capacity <= 0:
                 await self.flush(force=True)
@@ -156,7 +167,7 @@ class SlackRenderer:
         await self._push(force=force)
 
     async def _push(self, force: bool = False, force_status: bool = False) -> None:
-        if self._ts is None:
+        if self._ts is None or self._broken:
             return
         now = time.monotonic()
         if not force:
@@ -170,32 +181,39 @@ class SlackRenderer:
             )
             self._last_flushed_len = len(self._body)
             self._last_flush_at = now
-        except SlackApiError as e:
+        except Exception as e:  # noqa: BLE001 — must never reach the stream consumer
+            # Not sticky, unlike a failed post: every _push rewrites the whole
+            # body, so the next one repairs a dropped edit with nothing lost.
             log.warning("chat_update failed: %s", e)
 
     async def _roll_over(self) -> None:
-        # Same rule as open(): never raise into the turn's stream consumer. If the
-        # continuation message can't be posted, stop rendering (`_ts = None`)
-        # rather than overwriting the message we just filled with the next slice.
+        # Same rule as open(): never raise into the turn's stream consumer. A
+        # failed continuation is terminal for this renderer — see `_broken`. The
+        # text already posted survives; `_ts = None` keeps replace_with() from
+        # overwriting the last full message with an error line.
         try:
             resp = await self._client.chat_postMessage(
                 channel=self._channel, thread_ts=self._thread_ts, text="…"
             )
-        except SlackApiError as e:
-            log.warning("chat_postMessage (roll-over) failed; dropping the rest: %s", e)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "chat_postMessage (roll-over) failed; dropping the remainder of "
+                "this reply (%d chars rendered so far): %s", self._last_flushed_len, e,
+            )
+            self._broken = True
             self._ts = None
-        else:
-            self._ts = resp["ts"]
+            return
+        self._ts = resp["ts"]
         self._body = ""
         self._last_flushed_len = 0
         self._last_flush_at = 0.0
 
     async def replace_with(self, text: str) -> None:
-        if self._ts is None:
+        if self._ts is None or self._broken:
             return
         try:
             await self._client.chat_update(channel=self._channel, ts=self._ts, text=text)
-        except SlackApiError:
+        except Exception:  # noqa: BLE001
             log.exception("chat_update (error message) failed")
 
 
