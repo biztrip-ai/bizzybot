@@ -26,10 +26,16 @@ other people's pull requests*:
     successful poll would treat every pending PR as new and post a review to
     all of them at once. Seeding therefore retries until it genuinely succeeds
     and nothing fires until it does.
-  * GitHub's search index is eventually consistent, so a still-pending PR can
-    vanish from one poll's results and come back in the next. Forgetting a key
-    the first time it's missing would post a second review. A key is only
-    forgotten after FORGET_AFTER_MISSES consecutive absences.
+  * A key is forgotten only after a period of *wall-clock* absence, not after a
+    number of polls. GitHub drops a reviewer from `review-requested:` search
+    results once they submit a review, so the seen-map's real job is narrow:
+    bridge the lag between "we posted the review" and "the search index stops
+    returning the PR". Index lag is measured in seconds, so seconds are the
+    right unit. Counting polls tied the guard to PR_POLL_INTERVAL_S — at the
+    10s floor the window was 40s rather than the 4min you get at the default
+    60s, so tuning for responsiveness silently weakened the protection against
+    a duplicate review. It also drifted with review duration, since a Claude
+    turn runs inline in the poll loop and makes polls irregular.
   * A key is marked seen *as it fires*, one at a time — not for the whole batch
     up front. A shutdown (or a crash) part-way through a queue therefore leaves
     the not-yet-reviewed keys unseen, so the next poll still picks them up,
@@ -50,17 +56,24 @@ import json
 import logging
 import math
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 log = logging.getLogger("agent-wrapper.pr")
 
-# Consecutive polls a key must be absent from before we forget it — it is
-# dropped on the FORGET_AFTER_MISSES'th absence. Absorbs search-index flicker;
-# the cost is that a re-request arriving within this many intervals of the bot's
-# own review is swallowed. That is much better than double-reviewing, which is
-# public and can't be retracted.
-FORGET_AFTER_MISSES = 4
+# How long a key must be continuously absent from the search results before we
+# forget it, as a multiple of the poll interval and with an absolute floor. The
+# floor is what decouples the guard from PR_POLL_INTERVAL_S: lowering the
+# interval to get faster response to new requests must not shorten the window
+# that prevents a duplicate review.
+#
+# There is deliberately no ceiling. A long interval makes the window long, which
+# only delays how soon a genuine re-request (remove and re-add the reviewer) can
+# fire — the safe direction. Capping it would let a key expire between two polls
+# and reopen the duplicate-review hole this exists to close.
+FORGET_AFTER_POLLS = 4
+MIN_FORGET_AFTER_S = 300.0
 
 # Floor on the poll interval. Authenticated GitHub search allows ~30 req/min, so
 # a fat-fingered PR_POLL_INTERVAL_S=1 would burn the rate limit for everything
@@ -197,9 +210,14 @@ class PRPoller:
         login: str,
         on_new: Callable[[PR], Awaitable[None]],
         interval_s: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._login = login
         self._on_new = on_new
+        # Monotonic, not wall clock: an NTP step or a DST change must not be
+        # able to expire a key early and let a duplicate review through.
+        # Injectable so the forget window is testable without sleeping.
+        self._clock = clock
         # `not (x >= floor)` rather than `x < floor` so NaN is caught too: every
         # comparison against NaN is False, so `nan < 10` would sail past the
         # floor and `asyncio.sleep(nan)` raises on each pass of the poll loop,
@@ -212,8 +230,10 @@ class PRPoller:
             )
             interval_s = MIN_INTERVAL_S
         self._interval_s = interval_s
-        # key -> consecutive polls in which it was absent (0 = present last poll).
-        self._seen: dict[str, int] = {}
+        self._forget_after_s = max(FORGET_AFTER_POLLS * interval_s, MIN_FORGET_AFTER_S)
+        # key -> monotonic timestamp at which it was last confirmed present (or
+        # claimed by _mark_seen). Absence is measured in seconds from that.
+        self._seen: dict[str, float] = {}
         self._seeded = False
         self._fetch_failures = 0
         self._task: Optional[asyncio.Task] = None
@@ -238,8 +258,8 @@ class PRPoller:
         # operator would see a healthy wrapper with a silently dead feature.
         self._task.add_done_callback(self._on_task_done)
         log.info(
-            "PR review poller started: login=%s interval=%.0fs",
-            self._login, self._interval_s,
+            "PR review poller started: login=%s interval=%.0fs forget-after=%.0fs",
+            self._login, self._interval_s, self._forget_after_s,
         )
 
     @staticmethod
@@ -280,21 +300,20 @@ class PRPoller:
         because a restart re-seeds every pending request as seen, they would
         never be reviewed at all.
         """
+        now = self._clock()
         current = {p.key for p in prs}
-        for key in list(self._seen):
+        for key, last_present in list(self._seen.items()):
             if key in current:
-                self._seen[key] = 0
-            else:
-                self._seen[key] += 1
-                if self._seen[key] >= FORGET_AFTER_MISSES:
-                    del self._seen[key]
+                self._seen[key] = now
+            elif now - last_present > self._forget_after_s:
+                del self._seen[key]
         return [p for p in prs if p.key not in self._seen]
 
     def _mark_seen(self, pr: PR) -> None:
         """Claim a PR just before reviewing it. At-most-once on purpose: a
         review that fails half-way must not be retried on the next poll, because
         the first attempt may already have posted."""
-        self._seen[pr.key] = 0
+        self._seen[pr.key] = self._clock()
 
     async def _loop(self) -> None:
         # Seed until it actually succeeds. Firing nothing until we have a real
@@ -318,7 +337,8 @@ class PRPoller:
                     )
                     await asyncio.sleep(self._interval_s)
                     continue
-                self._seen = {p.key: 0 for p in prs}
+                now = self._clock()
+                self._seen = {p.key: now for p in prs}
                 self._seeded = True
                 log.info(
                     "PR poller seeded with %d existing request(s) for %s",

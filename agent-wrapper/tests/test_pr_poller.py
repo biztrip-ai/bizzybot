@@ -17,13 +17,28 @@ import pytest
 
 from bizzybot_agent_wrapper import pr_poller
 from bizzybot_agent_wrapper.pr_poller import (
-    FORGET_AFTER_MISSES,
+    FORGET_AFTER_POLLS,
     MAX_FIRES_PER_POLL,
+    MIN_FORGET_AFTER_S,
     MIN_INTERVAL_S,
     PR,
     PRPoller,
     parse_search_output,
 )
+
+
+class _Clock:
+    """Hand-cranked monotonic clock, so the forget window is tested in seconds
+    without any test actually sleeping."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
 
 
 def _pr(number: int = 1, repo: str = "acme/widgets", **kw) -> PR:
@@ -41,8 +56,12 @@ def _poller(**kw) -> PRPoller:
     async def _noop(pr: PR) -> None:
         return None
 
-    return PRPoller(login=kw.get("login", "@me"), on_new=kw.get("on_new", _noop),
-                    interval_s=kw.get("interval_s", 60.0))
+    return PRPoller(
+        login=kw.get("login", "@me"),
+        on_new=kw.get("on_new", _noop),
+        interval_s=kw.get("interval_s", 60.0),
+        clock=kw.get("clock", _Clock()),
+    )
 
 
 # --- parse_search_output ----------------------------------------------------
@@ -83,33 +102,77 @@ def test_search_index_flicker_does_not_refire():
     """GitHub's search index is eventually consistent: a still-pending PR can
     drop out of one poll and come back. Re-firing would post a second public
     review that can't be retracted."""
-    p = _poller()
+    clock = _Clock()
+    p = _poller(clock=clock)
     pr = _pr()
     p._mark_seen(pr)
-    for _ in range(FORGET_AFTER_MISSES - 1):  # absent, but not long enough
+    for _ in range(20):  # absent across many polls, but well inside the window
+        clock.advance(10)
         assert p._select_new([]) == []
     assert p._select_new([pr]) == []  # reappears — not re-reviewed
 
 
-def test_key_forgotten_after_exactly_forget_after_misses():
-    """The constant means what it says: dropped on the Nth absence, not N+1."""
-    p = _poller()
+def test_key_survives_right_up_to_the_window_then_is_forgotten():
+    clock = _Clock()
+    p = _poller(clock=clock)
     pr = _pr()
     p._mark_seen(pr)
-    for _ in range(FORGET_AFTER_MISSES - 1):
-        p._select_new([])
-        assert pr.key in p._seen
+
+    clock.advance(p._forget_after_s)  # exactly at the boundary — still held
+    p._select_new([])
+    assert pr.key in p._seen
+
+    clock.advance(1)
     p._select_new([])
     assert pr.key not in p._seen
 
 
-def test_genuine_rerequest_fires_again_once_forgotten():
-    p = _poller()
+def test_forget_window_is_wall_clock_not_poll_count():
+    """The whole point of the change: a poller at the 10s floor must get the
+    same protection as one at the 60s default. Under poll-counting this key
+    would have been forgotten after 4 polls (40s)."""
+    clock = _Clock()
+    p = _poller(interval_s=MIN_INTERVAL_S, clock=clock)
     pr = _pr()
     p._mark_seen(pr)
-    for _ in range(FORGET_AFTER_MISSES):
+    assert p._forget_after_s == MIN_FORGET_AFTER_S  # floor, not 4 x 10s
+
+    for _ in range(10):  # 100s of absence — 10 polls, still protected
+        clock.advance(MIN_INTERVAL_S)
         p._select_new([])
+    assert pr.key in p._seen
+    assert p._select_new([pr]) == []  # a stale index read does not re-review
+
+
+def test_long_interval_scales_the_window_up():
+    """No ceiling: a long interval must not let a key expire between two polls,
+    which would reopen the duplicate-review hole."""
+    p = _poller(interval_s=600.0)
+    assert p._forget_after_s == FORGET_AFTER_POLLS * 600.0
+    assert p._forget_after_s > 600.0  # survives at least one whole interval
+
+
+def test_genuine_rerequest_fires_again_once_forgotten():
+    clock = _Clock()
+    p = _poller(clock=clock)
+    pr = _pr()
+    p._mark_seen(pr)
+    clock.advance(p._forget_after_s + 1)
+    p._select_new([])
     assert [x.key for x in p._select_new([pr])] == [pr.key]
+
+
+def test_presence_refreshes_the_timestamp():
+    """A PR that stays pending for hours must never age out while it is still
+    being returned by the search."""
+    clock = _Clock()
+    p = _poller(clock=clock)
+    pr = _pr()
+    p._mark_seen(pr)
+    for _ in range(50):
+        clock.advance(p._forget_after_s * 0.9)
+        assert p._select_new([pr]) == []  # present each time -> never forgotten
+    assert pr.key in p._seen
 
 
 def test_select_new_does_not_claim_the_batch():
