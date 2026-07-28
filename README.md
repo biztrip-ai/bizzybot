@@ -119,6 +119,9 @@ Two things worth knowing before you turn this on:
   attacker-controlled input to a Claude session running in `bypassPermissions`. The
   agent is instructed not to check out or execute the branch and never to `--approve`,
   but those are prompt-level constraints, not a sandbox.
+- **Run this on one machine per `gh` account.** The record of what's already been
+  reviewed is per-process and isn't persisted, so two wrappers sharing a bot account
+  would each keep their own and both review every PR.
 
 
 # Running from source

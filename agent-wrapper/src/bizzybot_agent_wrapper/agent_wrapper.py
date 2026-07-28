@@ -596,12 +596,15 @@ async def handle_email_event(
     subject = payload.get("subject") or "(no subject)"
     body = payload.get("body") or ""
 
-    announce = f":email: *New email* from {sender}\n> *{subject}*"
+    # Escaped: sender, subject and body are attacker-controlled, and Slack would
+    # otherwise render `<http://evil.example|IT: reset your password>` in the
+    # announce message as a real link.
+    announce = f":email: *New email* from {_slack_escape(sender)}\n> *{_slack_escape(subject)}*"
     if body:
         snippet = " ".join(body.split())
         if len(snippet) > 200:
             snippet = snippet[:199] + "…"
-        announce += f"\n> {snippet}"
+        announce += f"\n> {_slack_escape(snippet)}"
     try:
         resp = await slack.chat_postMessage(channel=channel, text=announce)
     except Exception:  # noqa: BLE001
@@ -906,10 +909,11 @@ async def main() -> None:
             async def on_pr_review_requested(pr: pr_poller.PR) -> None:
                 await handle_pr_review_request(pr, pr_channel, sessions, slack)
 
+            # Constructed here but started inside the try below, so the finally
+            # that stops it covers every path on which it is running.
             poller = pr_poller.PRPoller(
                 login=pr_login, on_new=on_pr_review_requested, interval_s=pr_interval
             )
-            poller.start()
         else:
             log.info("PR review poller disabled (set PR_REVIEW_CHANNEL to enable)")
 
@@ -971,6 +975,8 @@ async def main() -> None:
                 await dispatch_event(payload, sessions, slack)
 
         try:
+            if poller is not None:
+                poller.start()
             await consume(http, ws_url, ws_token, on_event, stop)
         finally:
             log.info("shutting down")
