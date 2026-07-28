@@ -92,6 +92,34 @@ costs you a seat.
 
 You can also use a Github App instead and configure the bot as a Github bot user.
 
+## Reviewing pull requests
+
+The agent can watch for pull requests that ask it to review, and review them on its
+own. Set `PR_REVIEW_CHANNEL` to a Slack channel ID and the wrapper polls GitHub for
+PRs with a pending review request for this machine's `gh` account. For each new one it
+opens a thread in that channel, reviews the PR, and submits the review with
+`gh pr review`. Reply in the thread to ask follow-ups — the session stays live.
+
+```bash
+PR_REVIEW_CHANNEL=C0123456789   # required; unset = feature off
+PR_REVIEW_LOGIN=@me             # default: whoever `gh` is authenticated as
+PR_POLL_INTERVAL_S=60           # default
+```
+
+Invite the bot to that channel first. Requests already pending when the wrapper starts
+are skipped, so restarting doesn't re-review a backlog — remove and re-add the reviewer
+to trigger one of those.
+
+Two things worth knowing before you turn this on:
+
+- **The trust boundary is the review request itself.** Only PRs where someone with
+  write access explicitly requested this account get picked up. That is the whole
+  gate. If you point this at public repos, consider restricting it further.
+- **The agent posts to GitHub unattended,** and a PR's diff and description are
+  attacker-controlled input to a Claude session running in `bypassPermissions`. The
+  agent is instructed not to check out or execute the branch and never to `--approve`,
+  but those are prompt-level constraints, not a sandbox.
+
 
 # Running from source
 
