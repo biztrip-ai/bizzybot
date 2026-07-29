@@ -113,6 +113,11 @@ class Chunk:
     summaries without re-parsing `text`. `is_error` is also set on the `result`
     chunk when the turn itself failed — the SDK reports that as a message, not
     an exception, so it is the only way to tell a failed turn from a quiet one.
+
+    `subagent` marks a chunk that a sub-agent produced in its own conversation
+    (the SDK calls it a sidechain; see Session.send) rather than the thread's
+    agent speaking. Anything that renders a chunk as the agent's own words must
+    skip these.
     """
 
     kind: str
@@ -120,6 +125,7 @@ class Chunk:
     name: Optional[str] = None
     args: Optional[dict] = None
     is_error: bool = False
+    subagent: bool = False
 
 
 class Session:
@@ -229,18 +235,29 @@ class Session:
                 await self._client.query(prompt)
                 async for msg in stream:
                     if isinstance(msg, AssistantMessage):
+                        # A sub-agent's own messages arrive on this same stream,
+                        # tagged with the tool_use id of the Task that spawned
+                        # it. They keep coming after the spawning turn's
+                        # ResultMessage — nothing ties them to a turn — so
+                        # whichever turn is open next reads another agent's
+                        # narration. Tag them so consumers can tell the thread
+                        # agent's voice from a sub-agent's; the turn number in
+                        # the log now says which one said what.
+                        sub = getattr(msg, "parent_tool_use_id", None)
+                        who = f"subagent[{sub}]" if sub else "assistant"
                         for block in msg.content:
                             if isinstance(block, TextBlock):
                                 self.log.info(
-                                    "turn %d: assistant text (%d chars): %r",
-                                    turn, len(block.text), _truncate(block.text, 200),
+                                    "turn %d: %s text (%d chars): %r",
+                                    turn, who, len(block.text),
+                                    _truncate(block.text, 200),
                                 )
                                 self.log.debug("turn %d: full text: %s", turn, block.text)
-                                yield Chunk("text", block.text)
+                                yield Chunk("text", block.text, subagent=bool(sub))
                             elif isinstance(block, ToolUseBlock):
                                 self.log.info(
-                                    "turn %d: tool_use %s id=%s args=%s",
-                                    turn, block.name, block.id,
+                                    "turn %d: %s tool_use %s id=%s args=%s",
+                                    turn, who, block.name, block.id,
                                     _truncate(repr(block.input or {}), 400),
                                 )
                                 yield Chunk(
@@ -248,6 +265,7 @@ class Session:
                                     _format_tool_use_full(block),
                                     name=block.name,
                                     args=dict(block.input or {}),
+                                    subagent=bool(sub),
                                 )
                             elif isinstance(block, ThinkingBlock):
                                 self.log.debug(
@@ -256,6 +274,12 @@ class Session:
                                     _truncate(block.thinking, 500),
                                 )
                     elif isinstance(msg, UserMessage):
+                        sub = getattr(msg, "parent_tool_use_id", None)
+                        # "main", not "assistant": a UserMessage here carries a
+                        # tool *result*, which the harness produced rather than
+                        # either agent — only whose tool call it answers is ours
+                        # to report.
+                        who = f"subagent[{sub}]" if sub else "main"
                         for block in msg.content:
                             if isinstance(block, ToolResultBlock):
                                 content = block.content
@@ -270,9 +294,9 @@ class Session:
                                 )
                                 self.log.log(
                                     level,
-                                    "turn %d: tool_result id=%s is_error=%s "
+                                    "turn %d: %s tool_result id=%s is_error=%s "
                                     "(%d chars): %r",
-                                    turn, block.tool_use_id, block.is_error,
+                                    turn, who, block.tool_use_id, block.is_error,
                                     len(content_str), _truncate(content_str, 200),
                                 )
                                 self.log.debug(
@@ -284,6 +308,7 @@ class Session:
                                         block.tool_use_id, block.is_error, content_str
                                     ),
                                     is_error=bool(block.is_error),
+                                    subagent=bool(sub),
                                 )
                     elif isinstance(msg, SystemMessage):
                         data = getattr(msg, "data", {}) or {}
