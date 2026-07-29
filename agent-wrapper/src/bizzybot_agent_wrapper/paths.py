@@ -28,8 +28,13 @@ def log_path(name: str) -> str:
     """Absolute path to a log file by basename, in a ``logs/`` subdirectory.
 
     Kept out of the state dir proper so the one-file-per-run logs don't bury
-    ``sessions.json`` and friends.
+    ``sessions.json`` and friends. Created ``0700``: at ``LOG_LEVEL=DEBUG`` these
+    files hold Slack message text and tool arguments, so they get the same
+    treatment as the ``0600`` config file that holds the registration token.
+
+    Absolute even when BIZZYBOT_STATE_DIR is relative, so the path we log at
+    startup is one you can paste into an ``ssh``/``tail`` command.
     """
     d = os.path.join(state_dir(), "logs")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, name)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return os.path.abspath(os.path.join(d, name))

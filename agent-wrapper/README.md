@@ -130,21 +130,41 @@ Kept in `~/.bizzybot/` (override with `BIZZYBOT_STATE_DIR`):
 - `sessions.json` — per-thread Claude session ids (for resume across restarts).
 - `settings.env` — your agent settings (see above). Hand-edited, not written by
   the agent-wrapper.
-- `logs/` — one log file per run (see below).
+- `logs/` — one log file per run (see below). May hold sensitive text; kept `0700`.
 
 ## Logs
 
 Logs go to the console *and* to a file, so you can read them back on a machine
-you aren't sitting in front of — `ssh agent-laptop 'tail -f ~/.bizzybot/logs/*.log'`.
+you aren't sitting in front of:
 
-Each run gets its own file, named for the moment it started:
-`~/.bizzybot/logs/agent-wrapper-20260729-153012.log`. Runs never overwrite each
-other, and the names sort chronologically.
+```
+ssh agent-laptop 'tail -F ~/.bizzybot/logs/agent-wrapper-20260729-153012-4711.log'
+```
+
+Use `tail -F`, not `-f`, and name one file rather than globbing. `-f` follows the
+file descriptor, so the moment the size cap rotates your file to `.log.1` it goes
+silent — looking exactly like an idle agent while the run keeps logging. And a
+`*.log` glob expands over every past run, since nothing is pruned.
+
+Each run gets its own file, named for the moment it started plus the pid:
+`~/.bizzybot/logs/agent-wrapper-20260729-153012-4711.log`. The names sort
+chronologically, and no two runs can collide on one.
 
 A file is capped at 1 MiB (`BIZZYBOT_LOG_MAX_BYTES`); past that it rotates once,
 so a long-running agent keeps its most recent megabyte in the `.log` and the one
-before it in `.log.1`, and drops anything older. Set `LOG_LEVEL=DEBUG` to also
-capture the model's full reply text and thinking blocks — useful, but it fills
-that megabyte fast.
+before it in `.log.1`, and drops anything older. If the logs dir isn't writable,
+the run carries on console-only rather than refusing to start.
+
+`LOG_LEVEL=DEBUG` captures the model's full reply text and thinking blocks. It
+sets the *root* level, so you also get the Slack and HTTP client's own debug
+output — request params, response bodies, channel and user ids (the `slack-sdk`
+redacts `Authorization`, so your bot token stays out). Useful, but it fills that
+megabyte fast, and it puts a lot of conversation content on disk.
+
+Set both of these in your shell environment or `.env` — **not** in
+`settings.env`, which is read too late in startup and only forwarded to the
+`claude` subprocess, so logging never sees it.
 
 Old run logs are never deleted; prune `~/.bizzybot/logs/` yourself if it grows.
+Note the `claude` subprocess's own stderr goes to the console only — it is not
+captured in the file.
