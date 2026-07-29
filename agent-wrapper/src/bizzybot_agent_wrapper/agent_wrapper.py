@@ -647,12 +647,15 @@ async def handle_pr_review_request(
     announce = f":eyes: *Review requested* — {link}{draft}\n> *{_slack_escape(pr.title)}*"
     try:
         resp = await slack.chat_postMessage(channel=channel, text=announce)
-    except Exception:  # noqa: BLE001 — a Slack failure mustn't kill the poll loop
+    except Exception as exc:  # noqa: BLE001 — contained by the poll loop
         log.exception(
             "PR announce failed for %s in channel %s — is PR_REVIEW_CHANNEL a channel "
             "id the bot has been invited to?", pr.key, channel,
         )
-        return
+        # No Claude turn (and therefore no GitHub write) has started yet. Tell
+        # the poller this specific failure is safe to release and retry rather
+        # than silently suppressing the request for the life of the process.
+        raise pr_poller.ReviewNotStarted from exc
     parent_ts = resp["ts"]
 
     synth = {

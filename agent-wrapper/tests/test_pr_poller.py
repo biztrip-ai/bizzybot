@@ -23,6 +23,7 @@ from bizzybot_agent_wrapper.pr_poller import (
     MIN_INTERVAL_S,
     PR,
     PRPoller,
+    ReviewNotStarted,
     parse_search_output,
 )
 
@@ -71,20 +72,38 @@ def test_prefers_name_with_owner_over_bare_name():
     """The bare `name` collides across owners, so it must never win — two repos
     called `widgets` under different orgs would share a dedup key."""
     [pr] = parse_search_output(
-        [{"number": 7, "repository": {"name": "widgets", "nameWithOwner": "acme/widgets"}}]
+        [{
+            "url": "https://github.com/acme/widgets/pull/7",
+            "title": "change widgets",
+            "number": 7,
+            "repository": {"name": "widgets", "nameWithOwner": "acme/widgets"},
+        }]
     )
     assert pr.repo == "acme/widgets"
     assert pr.key == "acme/widgets#7"
 
 
-def test_survives_malformed_entries():
-    """An exception escaping the parser during seeding would kill the poll task
-    outright and disable the feature until restart."""
+def test_skips_malformed_entries():
+    """Malformed upstream data must neither kill the poller nor select the
+    target of an unattended write using placeholder identifiers."""
     items = ["a string", None, 42, {"number": "not-a-number", "repository": "not-an-object"}]
-    out = parse_search_output(items)
-    assert len(out) == 1  # only the dict survives
-    assert out[0].number == 0
-    assert out[0].repo == "?"
+    assert parse_search_output(items) == []
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"url": "", "title": "t", "number": 1, "repository": {"nameWithOwner": "acme/w"}},
+        {"url": "https://github.com/acme/w/pull/2", "title": "t", "number": 1,
+         "repository": {"nameWithOwner": "acme/w"}},
+        {"url": "https://github.com/acme/w/pull/1", "title": "t", "number": 1,
+         "repository": {"name": "w"}},
+        {"url": "https://github.com/acme/w/pull/1", "title": None, "number": 1,
+         "repository": {"nameWithOwner": "acme/w"}},
+    ],
+)
+def test_rejects_inconsistent_write_targets(item):
+    assert parse_search_output([item]) == []
 
 
 # --- _select_new: the dedup / forget contract -------------------------------
@@ -175,6 +194,12 @@ def test_presence_refreshes_the_timestamp():
     assert pr.key in p._seen
 
 
+def test_duplicate_search_entries_are_selected_only_once():
+    p = _poller()
+    pr = _pr()
+    assert p._select_new([pr, pr]) == [pr]
+
+
 def test_select_new_does_not_claim_the_batch():
     """The whole batch must not be marked seen up front. If it were, a shutdown
     part-way through the queue would record PRs as handled that were never
@@ -255,9 +280,46 @@ def test_json_null_is_none_not_empty(monkeypatch):
 
 
 def test_successful_fetch_parses(monkeypatch):
-    payload = b'[{"url":"u","title":"t","number":3,"repository":{"nameWithOwner":"acme/w"}}]'
+    payload = b'[{"url":"https://github.com/acme/w/pull/3","title":"t","number":3,"repository":{"nameWithOwner":"acme/w"}}]'
     out = _fetch_with(monkeypatch, payload)
     assert [p.key for p in out] == ["acme/w#3"]
+
+
+# --- dispatch failure semantics ---------------------------------------------
+
+
+def test_definitely_not_started_dispatch_is_retried():
+    calls = 0
+    pr = _pr()
+
+    async def on_new(item: PR) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ReviewNotStarted("Slack announcement failed")
+        raise asyncio.CancelledError
+
+    async def exercise() -> None:
+        p = PRPoller(login="@me", on_new=on_new, interval_s=60)
+        responses = iter([[], [pr], [pr]])
+
+        async def fetch():
+            return next(responses)
+
+        async def no_sleep(_seconds):
+            return None
+
+        p._fetch = fetch
+        original_sleep = pr_poller.asyncio.sleep
+        pr_poller.asyncio.sleep = no_sleep
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await p._loop()
+        finally:
+            pr_poller.asyncio.sleep = original_sleep
+
+    asyncio.run(exercise())
+    assert calls == 2
 
 
 # --- fire cap ---------------------------------------------------------------

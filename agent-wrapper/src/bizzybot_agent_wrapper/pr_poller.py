@@ -59,6 +59,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
+from urllib.parse import urlparse
 
 log = logging.getLogger("agent-wrapper.pr")
 
@@ -103,6 +104,14 @@ class PR:
     @property
     def key(self) -> str:
         return f"{self.repo}#{self.number}"
+
+
+class ReviewNotStarted(Exception):
+    """The callback failed before it could possibly submit a GitHub review.
+
+    Unlike an arbitrary callback failure, this is safe to retry: there is no
+    risk that the first attempt posted a review but lost its response.
+    """
 
 
 REVIEW_INSTRUCTION_TEMPLATE = """\
@@ -168,12 +177,11 @@ def _kill(proc: asyncio.subprocess.Process) -> None:
 
 
 def parse_search_output(items: list[dict]) -> list[PR]:
-    """Map `gh search prs --json …` output to PRs. Pure: no I/O, so this is the
-    cheap seam to exercise against a captured payload.
+    """Map `gh search prs --json …` output to validated PRs.
 
-    Tolerates junk. This runs on whatever `gh` printed, and a malformed entry
-    must not raise: an exception escaping here during seeding would kill the
-    poll task outright and disable the feature until the next restart.
+    Malformed entries are skipped rather than represented with placeholder
+    values. This data ultimately selects the target of an unattended write, so
+    an empty URL or a colliding ``?#0`` key must never reach the callback.
     """
     out: list[PR] = []
     for it in items:
@@ -181,23 +189,41 @@ def parse_search_output(items: list[dict]) -> list[PR]:
             log.warning("skipping non-object entry in gh search output: %r", it)
             continue
         repo_obj = it.get("repository")
-        if not isinstance(repo_obj, dict):
-            repo_obj = {}
-        # `repository` carries both spellings. nameWithOwner must win: the bare
-        # `name` collides across owners and is unsafe as a dedup key.
-        repo = repo_obj.get("nameWithOwner") or repo_obj.get("name") or "?"
+        repo = repo_obj.get("nameWithOwner") if isinstance(repo_obj, dict) else None
+        url = it.get("url")
+        title = it.get("title")
         try:
             number = int(it.get("number", 0))
         except (TypeError, ValueError):
             number = 0
+
+        # Validate that all three independent identifiers agree. Do not
+        # hard-code github.com: `gh` may be authenticated to a GHES host.
+        parsed = urlparse(url) if isinstance(url, str) else None
+        expected_path = f"/{repo}/pull/{number}" if isinstance(repo, str) else None
+        if (
+            not isinstance(repo, str)
+            or repo.count("/") != 1
+            or not all(repo.split("/"))
+            or number <= 0
+            or parsed is None
+            or parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.path.rstrip("/") != expected_path
+            or not isinstance(title, str)
+        ):
+            log.warning("skipping malformed entry in gh search output: %r", it)
+            continue
+
+        updated_at = it.get("updatedAt")
         out.append(
             PR(
-                url=it.get("url", ""),
-                title=it.get("title", ""),
+                url=url,
+                title=title,
                 number=number,
                 repo=repo,
-                updated_at=it.get("updatedAt", ""),
-                is_draft=bool(it.get("isDraft", False)),
+                updated_at=updated_at if isinstance(updated_at, str) else "",
+                is_draft=it.get("isDraft") is True,
             )
         )
     return out
@@ -307,7 +333,17 @@ class PRPoller:
                 self._seen[key] = now
             elif now - last_present > self._forget_after_s:
                 del self._seen[key]
-        return [p for p in prs if p.key not in self._seen]
+        # Search should not return duplicates, but do not let malformed or
+        # changing upstream output turn one poll into two public reviews. Keep
+        # this local: returned PRs still must not be added to self._seen until
+        # the caller claims each one immediately before dispatch.
+        selected: list[PR] = []
+        selected_keys: set[str] = set()
+        for pr in prs:
+            if pr.key not in self._seen and pr.key not in selected_keys:
+                selected.append(pr)
+                selected_keys.add(pr.key)
+        return selected
 
     def _mark_seen(self, pr: PR) -> None:
         """Claim a PR just before reviewing it. At-most-once on purpose: a
@@ -372,6 +408,13 @@ class PRPoller:
                     self._mark_seen(pr)  # claim it before the write, not after
                     try:
                         await self._on_new(pr)
+                    except ReviewNotStarted:
+                        # The callback explicitly guarantees no GitHub write was
+                        # attempted, so releasing the claim is safe. Generic
+                        # failures remain claimed because their write outcome
+                        # may be ambiguous and a duplicate review is worse.
+                        self._seen.pop(pr.key, None)
+                        log.warning("review dispatch did not start for %s; will retry", pr.key)
                     except Exception:  # noqa: BLE001 — one bad PR mustn't kill the loop
                         log.exception("on_new callback failed for %s", pr.key)
             except asyncio.CancelledError:
