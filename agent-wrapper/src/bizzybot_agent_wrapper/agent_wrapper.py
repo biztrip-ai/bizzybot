@@ -26,6 +26,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+from logging.handlers import RotatingFileHandler
 from typing import Any, Awaitable, Callable, Optional
 
 import ssl
@@ -35,17 +37,13 @@ from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
 from . import email_reply, pr_poller
-from .paths import state_path
+from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
 from .slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
 
 load_dotenv()
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 log = logging.getLogger("agent-wrapper")
 
 # Per-user state dir (~/.bizzybot by default) — see paths.state_path.
@@ -958,7 +956,13 @@ async def consume(
                 if inflight:
                     await asyncio.gather(*inflight, return_exceptions=True)
         except aiohttp.ClientError as e:
-            log.warning("Central-Dispatch connection error: %s", e)
+            # aiohttp formats ClientResponseError with the full request URL, and
+            # ours carries ?token=… — so logging `e` raw would write a live
+            # Central-Dispatch credential into this run's log file, on every
+            # retry. Ephemeral on stderr; not in a file that is never pruned and
+            # sits in the same home dir as a bypassPermissions agent.
+            detail = str(e).replace(ws_token, "***") if ws_token else str(e)
+            log.warning("Central-Dispatch connection error: %s", detail)
 
         if stop.is_set():
             return
@@ -1109,6 +1113,63 @@ async def main() -> None:
             await sessions.close_all()
 
 
+def _setup_logging() -> Optional[str]:
+    """Log to stderr *and* to a fresh file for this run; return the file's path.
+
+    Called once from main_sync — not at import time, so merely importing the
+    package doesn't litter log files. Every logger in the package is left
+    unconfigured and propagates to the root, so this one call covers all of them.
+
+    The file is named for the moment the run started plus our pid —
+    ``agent-wrapper-20260729-153012-4711.log``, under ``~/.bizzybot/logs/`` — so
+    it sorts chronologically, and two runs sharing a state dir can't land on the
+    same name and shred each other's records (the timestamp alone has one-second
+    resolution, and repeats outright across a DST fall-back).
+
+    Each file is capped at BIZZYBOT_LOG_MAX_BYTES (1 MiB). backupCount has to be
+    at least 1: with 0, RotatingFileHandler's rollover reopens the same file in
+    append mode and the cap does nothing at all. So a run that outgrows the cap
+    keeps its most recent megabyte in the ``.log``, the megabyte before that in
+    ``.log.1``, and drops anything older.
+
+    The file is best-effort: an unwritable logs dir or an unparseable
+    BIZZYBOT_LOG_MAX_BYTES leaves us console-only, rather than stopping an agent
+    whose whole job is to stay connected. Returns None in that case.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    path: Optional[str] = None
+    problem: Optional[str] = None
+    try:
+        name = time.strftime("agent-wrapper-%Y%m%d-%H%M%S") + f"-{os.getpid()}.log"
+        path = log_path(name)
+        handlers.append(
+            RotatingFileHandler(
+                path,
+                maxBytes=int(os.getenv("BIZZYBOT_LOG_MAX_BYTES", str(1024 * 1024))),
+                backupCount=1,
+                # Explicit utf-8 rather than the locale's encoding: on a non-UTF-8
+                # locale (LC_ALL=en_US.ISO8859-1, or a Windows code page) the
+                # default would raise inside emit() and silently drop every record
+                # carrying an emoji — and we log Slack message text. `errors` for
+                # the reason sys.stderr sets it too: a filename that isn't valid
+                # UTF-8 reaches us as lone surrogates, which utf-8 can't encode
+                # either, and that would drop the record just the same.
+                encoding="utf-8",
+                errors="backslashreplace",
+            )
+        )
+    except (OSError, ValueError) as e:
+        path, problem = None, str(e)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+    )
+    if problem:
+        log.warning("no log file, logging to console only: %s", problem)
+    return path
+
+
 def _prevent_sleep_on_macos() -> None:
     """Keep the Mac awake while the wrapper runs so an idle laptop doesn't sleep
     and drop the WebSocket to Central-Dispatch.
@@ -1140,8 +1201,32 @@ def _prevent_sleep_on_macos() -> None:
 
 def main_sync() -> None:
     """Console-script entry point (`bizzybot`). Sync wrapper around main()."""
+    log_file = _setup_logging()
+    if log_file:
+        log.info("logging to %s", log_file)
     _prevent_sleep_on_macos()
-    asyncio.run(main())
+    # Why the exit reason is logged and not just raised: an uncaught traceback
+    # (or sys.exit's message) is written straight to stderr by the interpreter,
+    # bypassing logging — so it would be missing from the very file you'd go
+    # read to find out why the agent stopped.
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("interrupted; shutting down")
+        # Exit 130 (128 + SIGINT) the way a Ctrl-C'd process is expected to, which
+        # is what a bare `raise` here would have given us — just without dumping a
+        # KeyboardInterrupt traceback for what is a normal way to stop the agent.
+        sys.exit(130)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            log.error("exiting: %s", e.code)
+        raise
+    except Exception:
+        log.exception("unhandled error; exiting")
+        # log.exception has already put the traceback on stderr *and* in the file,
+        # so re-raising would print the whole thing a second time. Exit 1, which is
+        # what the interpreter would have given us for an uncaught exception.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
