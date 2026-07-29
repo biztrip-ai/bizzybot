@@ -130,3 +130,21 @@ Kept in `~/.bizzybot/` (override with `BIZZYBOT_STATE_DIR`):
 - `sessions.json` — per-thread Claude session ids (for resume across restarts).
 - `settings.env` — your agent settings (see above). Hand-edited, not written by
   the agent-wrapper.
+- `logs/` — one log file per run (see below).
+
+## Logs
+
+Logs go to the console *and* to a file, so you can read them back on a machine
+you aren't sitting in front of — `ssh agent-laptop 'tail -f ~/.bizzybot/logs/*.log'`.
+
+Each run gets its own file, named for the moment it started:
+`~/.bizzybot/logs/agent-wrapper-20260729-153012.log`. Runs never overwrite each
+other, and the names sort chronologically.
+
+A file is capped at 1 MiB (`BIZZYBOT_LOG_MAX_BYTES`); past that it rotates once,
+so a long-running agent keeps its most recent megabyte in the `.log` and the one
+before it in `.log.1`, and drops anything older. Set `LOG_LEVEL=DEBUG` to also
+capture the model's full reply text and thinking blocks — useful, but it fills
+that megabyte fast.
+
+Old run logs are never deleted; prune `~/.bizzybot/logs/` yourself if it grows.

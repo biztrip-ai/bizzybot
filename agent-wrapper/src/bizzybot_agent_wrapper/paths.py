@@ -22,3 +22,14 @@ def state_dir() -> str:
 def state_path(name: str) -> str:
     """Absolute path to a state file by basename."""
     return os.path.join(state_dir(), name)
+
+
+def log_path(name: str) -> str:
+    """Absolute path to a log file by basename, in a ``logs/`` subdirectory.
+
+    Kept out of the state dir proper so the one-file-per-run logs don't bury
+    ``sessions.json`` and friends.
+    """
+    d = os.path.join(state_dir(), "logs")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)

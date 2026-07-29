@@ -26,6 +26,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+from logging.handlers import RotatingFileHandler
 from typing import Any, Awaitable, Callable, Optional
 
 import ssl
@@ -35,17 +37,13 @@ from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
 from . import email_reply, pr_poller
-from .paths import state_path
+from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
 from .slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
 
 load_dotenv()
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 log = logging.getLogger("agent-wrapper")
 
 # Per-user state dir (~/.bizzybot by default) — see paths.state_path.
@@ -1030,6 +1028,39 @@ async def main() -> None:
             await sessions.close_all()
 
 
+def _setup_logging() -> str:
+    """Log to stderr *and* to a fresh file for this run; return the file's path.
+
+    Called once from main_sync — not at import time, so merely importing the
+    package doesn't litter log files. Every logger in the package is left
+    unconfigured and propagates to the root, so this one call covers all of them.
+
+    The file is named for the moment the run started —
+    ``agent-wrapper-20260729-153012.log``, under ``~/.bizzybot/logs/`` — so runs
+    never overwrite each other and sort chronologically.
+
+    Each file is capped at BIZZYBOT_LOG_MAX_BYTES (1 MiB). backupCount has to be
+    at least 1: with 0, RotatingFileHandler's rollover reopens the same file in
+    append mode and the cap does nothing at all. So a run that outgrows the cap
+    keeps its most recent megabyte in the ``.log``, the megabyte before that in
+    ``.log.1``, and drops anything older.
+    """
+    path = log_path(time.strftime("agent-wrapper-%Y%m%d-%H%M%S.log"))
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            RotatingFileHandler(
+                path,
+                maxBytes=int(os.getenv("BIZZYBOT_LOG_MAX_BYTES", str(1024 * 1024))),
+                backupCount=1,
+            ),
+        ],
+    )
+    return path
+
+
 def _prevent_sleep_on_macos() -> None:
     """Keep the Mac awake while the wrapper runs so an idle laptop doesn't sleep
     and drop the WebSocket to Central-Dispatch.
@@ -1061,8 +1092,24 @@ def _prevent_sleep_on_macos() -> None:
 
 def main_sync() -> None:
     """Console-script entry point (`bizzybot`). Sync wrapper around main()."""
+    log_file = _setup_logging()
+    log.info("logging to %s", log_file)
     _prevent_sleep_on_macos()
-    asyncio.run(main())
+    # Why the exit reason is logged and not just raised: an uncaught traceback
+    # (or sys.exit's message) is written straight to stderr by the interpreter,
+    # bypassing logging — so it would be missing from the very file you'd go
+    # read to find out why the agent stopped.
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("interrupted; shutting down")
+    except SystemExit as e:
+        if e.code not in (0, None):
+            log.error("exiting: %s", e.code)
+        raise
+    except Exception:
+        log.exception("unhandled error; exiting")
+        raise
 
 
 if __name__ == "__main__":
