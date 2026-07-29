@@ -163,6 +163,17 @@ class SlackRenderer:
         self._status = label
         await self._push(force_status=True)
 
+    def clear_status(self) -> None:
+        """Forget any running-tool label without redrawing.
+
+        `append()` clears the status as a side effect of adding text, which is
+        the only thing that normally retires a label. A turn whose last tool call
+        is followed by no rendered text therefore ends with `_render()` still
+        emitting a status line, so the finished message reads as if a tool were
+        still running. Callers clear it once the turn is over; the next push
+        (the terminal `flush(force=True)`) draws the body alone."""
+        self._status = ""
+
     async def flush(self, force: bool = False) -> None:
         await self._push(force=force)
 

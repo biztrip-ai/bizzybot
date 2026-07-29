@@ -415,8 +415,6 @@ def normalize_slack_event(
     thread_ts = event.get("thread_ts") or ts
     text = event.get("text") or ""
     # Strip a leading bot @-mention ("<@U123> do x" -> "do x").
-    import re
-
     text = re.sub(r"^\s*<@[UW][A-Z0-9]+>\s*", "", text).strip()
 
     return {
@@ -456,16 +454,55 @@ async def handle_user_message(
     renderer = SlackRenderer(slack, channel, reply_ts, queued=session.is_busy)
     await renderer.open()
     full_text: list[str] = []
+    # Whether any of the *thread's* agent's own words reached the message. It
+    # gates the terminal render: the user wrote to us, so a turn that ends with
+    # nothing on screen must say so rather than leave the "thinking…"
+    # placeholder, or a finished tool's label, up forever.
+    rendered = False
     try:
         async for chunk in session.send(text):
             if chunk.kind == "turn_start":
                 await renderer.mark_active()
+            elif chunk.subagent:
+                # Another agent's narration, arriving on the shared stream from a
+                # sub-agent an earlier turn spawned. Rendering it here would put
+                # it in this message as if the thread's agent had said it.
+                continue
             elif chunk.kind == "text":
-                full_text.append(chunk.text)
-                await renderer.append(ATTACH_RE.sub("", chunk.text))
+                # `full_text` keeps the ATTACH directives — the upload scan and
+                # the email reply below both read it — and loses the sentinel, so
+                # the token cannot ride out to an email either.
+                stripped = strip_flush_sentinel(chunk.text)
+                visible = ATTACH_RE.sub("", stripped)
+                if not visible.strip():
+                    if stripped.strip():
+                        full_text.append(stripped)  # an ATTACH line and nothing else
+                    continue
+                # Set from what actually reaches Slack, not from what survived the
+                # sentinel strip: a reply that is only an ATTACH line renders no
+                # text, and counting it here would leave the placeholder standing.
+                rendered = True
+                full_text.append(stripped)
+                await renderer.append(visible)
             elif chunk.kind == "tool_use":
                 await renderer.status(tool_label(chunk.name, chunk.args))
-        await renderer.flush(force=True)
+        if rendered:
+            # The turn is over, so nothing is still running: retire any trailing
+            # tool label before the last draw, or a finished reply ends on a line
+            # that reads as a tool still in flight.
+            renderer.clear_status()
+            await renderer.flush(force=True)
+        else:
+            # Nothing of the agent's own reached Slack — the reply was only the
+            # sentinel, only a sub-agent's narration, only an ATTACH line, or only
+            # tool calls. A flush turn in this position stays silent, but here the
+            # user did write to us, so end on something terminal and true instead
+            # of a "thinking…" placeholder that never resolves.
+            log.info("nothing rendered for %s; closing the message", thread_key)
+            if ATTACH_RE.search("\n".join(full_text)):
+                await renderer.replace_with("_see attached_")
+            else:
+                await renderer.replace_with("_nothing new to report_")
     except Exception as e:  # noqa: BLE001 — surface any turn failure to Slack
         log.exception("session error on %s", thread_key)
         await renderer.replace_with(f":warning: error: `{e}`")
@@ -498,14 +535,6 @@ FLUSH_COALESCE_S = 5.0
 
 FLUSH_SENTINEL = "NOTHING_TO_REPORT"
 
-# The sentinel is a control token, never something to show a human, but the
-# agent decides it has nothing to report *after* narrating and running tools,
-# so it arrives as a trailing text block (or trailing text inside one) rather
-# than as the whole reply. Matching it only against the reply's opening text
-# therefore misses the common case. Word-bounded so it only strips the token
-# itself, not a longer identifier that happens to contain it.
-FLUSH_SENTINEL_RE = re.compile(rf"\b{FLUSH_SENTINEL}\b")
-
 FLUSH_PROMPT = (
     "[Automated wake-up — not a user message. One or more background tasks or "
     "sub-agents in this thread just finished. Report their results to the "
@@ -513,6 +542,48 @@ FLUSH_PROMPT = (
     "If every finished task's outcome has already been reported and there is "
     f"nothing new to say, reply with exactly {FLUSH_SENTINEL}.]"
 )
+
+# A line that is nothing but the sentinel, allowing for the markdown decoration
+# the agent reaches for on a short standalone line (the system prompt above tells
+# it to italicise with underscores) and a trailing full stop. `re.escape` so a
+# future sentinel containing regex metacharacters cannot turn into a wildcard.
+_SENTINEL_LINE_RE = re.compile(
+    rf"^[ \t]*[*_`~]{{0,3}}{re.escape(FLUSH_SENTINEL)}[*_`~]{{0,3}}[ \t]*[.!]?[ \t]*$\n?",
+    re.MULTILINE,
+)
+
+
+def strip_flush_sentinel(text: str) -> str:
+    """Remove the flush sentinel from a chunk of agent text.
+
+    The sentinel is protocol between the wrapper and the agent — a reader should
+    never see it. Suppressing it only where it is expected is not enough,
+    because it reaches the thread three ways:
+
+      1. as the whole reply to a flush turn (the case it was designed for);
+      2. as a trailing text block, after the agent has already narrated and run
+         tools in a flush turn and only then decides there is nothing new — by
+         which point the message is open and a first-chunk check no longer
+         applies;
+      3. as the whole reply to a *user* message, with no flush involved. The
+         convention is in the thread's context, so a content-free message like
+         "." reads as "nothing new to say" and the agent answers accordingly.
+         Observed in #bizzy-bot on 2026-07-29: three bare NOTHING_TO_REPORT
+         posts, turns 26-28, each answering a "." with 15 output tokens.
+
+    Matched a whole line at a time rather than as a bare substring. A substring
+    match cuts the token out of text that is *about* it — and this agent's
+    workspace is its own repository, so a reply quoting the assignment in this
+    very file is one it has to be able to write. Such a reply also rides out to
+    the email path via `full_text`, where a silent deletion is invisible.
+
+    Line matching covers both real routes above: one text block is one chunk (see
+    `Session.send`), so a sentinel the agent emits as its own block arrives as its
+    own chunk, whole. The cost is that a sentinel glued into the middle of a
+    sentence still shows — a leaked token reads worse than it looks, but quietly
+    editing a real answer is worse still.
+    """
+    return _SENTINEL_LINE_RE.sub("", text)
 
 
 async def flush_background_results(
@@ -542,21 +613,24 @@ async def flush_background_results(
             if chunk.kind == "turn_start":
                 if on_turn_start is not None:
                     on_turn_start()
+            elif chunk.subagent:
+                continue  # a sub-agent narrating, not this turn's report
             elif chunk.kind == "text":
-                # Drop the sentinel from every chunk, not just the first one:
-                # once `opened` is True a guard on the opening text no longer
-                # runs, so a turn that narrated before deciding it had nothing
-                # to report posted the token verbatim into the thread.
-                text = FLUSH_SENTINEL_RE.sub("", chunk.text)
-                if not text.strip():
+                # Strip on every chunk, not just the first: once `opened` is
+                # True a guard on the opening text no longer runs, and the agent
+                # decides it has nothing to report *after* narrating and running
+                # tools, so the sentinel usually arrives once the message is
+                # already open.
+                clean = strip_flush_sentinel(chunk.text)
+                if not clean.strip():
                     continue  # empty, or the sentinel and nothing else
                 if not opened:
                     # open() reports whether it posted; if Slack refused, leave
                     # `opened` False so the error path below still tries — going
                     # quiet here would strand the finished sub-agent for good.
                     opened = await renderer.open()
-                full_text.append(text)
-                await renderer.append(ATTACH_RE.sub("", text))
+                full_text.append(clean)
+                await renderer.append(ATTACH_RE.sub("", clean))
             elif chunk.kind == "tool_use" and opened:
                 await renderer.status(tool_label(chunk.name, chunk.args))
             elif chunk.kind == "result" and chunk.is_error:
@@ -581,6 +655,11 @@ async def flush_background_results(
     if not opened:
         log.info("flush: nothing to report on %s", thread_key)
         return
+    # Same reason as the user path: the turn is done, so no tool is still running
+    # and the report must not end on a status line. `append()` is the only thing
+    # that normally retires one, and the last text chunk here may well have been
+    # dropped as the sentinel or as a sub-agent's.
+    renderer.clear_status()
     await renderer.flush(force=True)
 
     paths = [m.group(1).strip() for m in ATTACH_RE.finditer("\n".join(full_text))]
