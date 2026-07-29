@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -489,6 +490,14 @@ FLUSH_COALESCE_S = 5.0
 
 FLUSH_SENTINEL = "NOTHING_TO_REPORT"
 
+# The sentinel is a control token, never something to show a human, but the
+# agent decides it has nothing to report *after* narrating and running tools,
+# so it arrives as a trailing text block (or trailing text inside one) rather
+# than as the whole reply. Matching it only against the reply's opening text
+# therefore misses the common case. Word-bounded so it only strips the token
+# itself, not a longer identifier that happens to contain it.
+FLUSH_SENTINEL_RE = re.compile(rf"\b{FLUSH_SENTINEL}\b")
+
 FLUSH_PROMPT = (
     "[Automated wake-up — not a user message. One or more background tasks or "
     "sub-agents in this thread just finished. Report their results to the "
@@ -526,15 +535,20 @@ async def flush_background_results(
                 if on_turn_start is not None:
                     on_turn_start()
             elif chunk.kind == "text":
+                # Drop the sentinel from every chunk, not just the first one:
+                # once `opened` is True a guard on the opening text no longer
+                # runs, so a turn that narrated before deciding it had nothing
+                # to report posted the token verbatim into the thread.
+                text = FLUSH_SENTINEL_RE.sub("", chunk.text)
+                if not text.strip():
+                    continue  # empty, or the sentinel and nothing else
                 if not opened:
-                    if chunk.text.strip() in ("", FLUSH_SENTINEL):
-                        continue
                     # open() reports whether it posted; if Slack refused, leave
                     # `opened` False so the error path below still tries — going
                     # quiet here would strand the finished sub-agent for good.
                     opened = await renderer.open()
-                full_text.append(chunk.text)
-                await renderer.append(ATTACH_RE.sub("", chunk.text))
+                full_text.append(text)
+                await renderer.append(ATTACH_RE.sub("", text))
             elif chunk.kind == "tool_use" and opened:
                 await renderer.status(tool_label(chunk.name, chunk.args))
             elif chunk.kind == "result" and chunk.is_error:
