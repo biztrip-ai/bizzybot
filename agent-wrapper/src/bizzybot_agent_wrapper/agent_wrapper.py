@@ -34,10 +34,10 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import email_reply
+from . import email_reply, pr_poller
 from .paths import state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
-from .settings import claude_env, load_settings
+from .settings import claude_env, load_settings, resolve
 from .slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
 
 load_dotenv()
@@ -96,6 +96,13 @@ Do this before you report back, and say what you cleaned up."""
 
 def _truthy(v: str | None) -> bool:
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _slack_escape(s: str) -> str:
+    """Escape the three characters Slack treats as markup. `&` must go first or
+    it would double-escape the entities added after it. PR titles and email
+    subjects routinely contain `<T>`, `a -> b`, and `&`."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _insecure_tls_ctx(url: str):
@@ -261,7 +268,7 @@ def preflight() -> None:
 # --- Session manager --------------------------------------------------------
 
 
-def build_session_manager() -> SessionManager:
+def build_session_manager(settings: Optional[dict[str, str]] = None) -> SessionManager:
     extra_args: dict[str, str | None] = {}
     # Chrome (Claude-in-Chrome browser MCP) is on by default so target envs don't
     # each have to set it; disable explicitly with CLAUDE_CHROME=0.
@@ -274,7 +281,8 @@ def build_session_manager() -> SessionManager:
     )
     # The user's settings file (~/.bizzybot/settings.env) — passed through to
     # each claude subprocess, and the source of an alternate model provider.
-    env, provider_model = claude_env(load_settings())
+    # main() loads it once and passes it in, so it isn't parsed (and logged) twice.
+    env, provider_model = claude_env(load_settings() if settings is None else settings)
     model = os.getenv("CLAUDE_MODEL") or None
     if provider_model:
         # An Anthropic model id would 404 at OpenRouter, so the provider's model
@@ -627,12 +635,15 @@ async def handle_email_event(
     subject = payload.get("subject") or "(no subject)"
     body = payload.get("body") or ""
 
-    announce = f":email: *New email* from {sender}\n> *{subject}*"
+    # Escaped: sender, subject and body are attacker-controlled, and Slack would
+    # otherwise render `<http://evil.example|IT: reset your password>` in the
+    # announce message as a real link.
+    announce = f":email: *New email* from {_slack_escape(sender)}\n> *{_slack_escape(subject)}*"
     if body:
         snippet = " ".join(body.split())
         if len(snippet) > 200:
             snippet = snippet[:199] + "…"
-        announce += f"\n> {snippet}"
+        announce += f"\n> {_slack_escape(snippet)}"
     try:
         resp = await slack.chat_postMessage(channel=channel, text=announce)
     except Exception:  # noqa: BLE001
@@ -655,6 +666,43 @@ async def handle_email_event(
             "subject": subject,
             "mailgun": payload.get("mailgun") or {},
         },
+    }
+    await handle_user_message(synth, sessions, slack)
+
+
+async def handle_pr_review_request(
+    pr: pr_poller.PR, channel: str, sessions: SessionManager, slack: AsyncWebClient
+) -> None:
+    """A GitHub PR just named this agent as a requested reviewer: announce it in
+    the configured channel, then run a Claude turn in that thread which reviews
+    the PR and submits the review with `gh pr review`.
+
+    Same shape as handle_email_event, minus the post-turn send step — Claude
+    submits the review itself, and `gh` auth is ambient on this machine, so
+    there are no credentials to keep out of the prompt.
+    """
+    link = f"<{pr.url}|{pr.repo}#{pr.number}>"
+    draft = " _(draft)_" if pr.is_draft else ""
+    announce = f":eyes: *Review requested* — {link}{draft}\n> *{_slack_escape(pr.title)}*"
+    try:
+        resp = await slack.chat_postMessage(channel=channel, text=announce)
+    except Exception as exc:  # noqa: BLE001 — contained by the poll loop
+        log.exception(
+            "PR announce failed for %s in channel %s — is PR_REVIEW_CHANNEL a channel "
+            "id the bot has been invited to?", pr.key, channel,
+        )
+        # No Claude turn (and therefore no GitHub write) has started yet. Tell
+        # the poller this specific failure is safe to release and retry rather
+        # than silently suppressing the request for the life of the process.
+        raise pr_poller.ReviewNotStarted from exc
+    parent_ts = resp["ts"]
+
+    synth = {
+        "thread_key": f"{channel}:{parent_ts}",
+        "channel": channel,
+        "reply_thread_ts": parent_ts,
+        "text": pr_poller.build_review_instruction(pr),
+        "files": [],
     }
     await handle_user_message(synth, sessions, slack)
 
@@ -843,6 +891,26 @@ async def consume(
             backoff = min(backoff * 2, 30.0)
 
 
+def pr_poller_config(settings: dict[str, str]) -> tuple[Optional[str], str, float]:
+    """(channel, login, interval) for the PR review poller. A None channel means
+    the feature is off. Values come from the real environment first, then
+    ~/.bizzybot/settings.env.
+
+    PR_REVIEW_LOGIN defaults to `@me`, which `gh` resolves to whoever the local
+    CLI is authenticated as — on an agent machine that is the bot account, so the
+    common case needs no configuration. An explicit login or `@org/team` also works.
+    """
+    channel = resolve(settings, "PR_REVIEW_CHANNEL")
+    login = resolve(settings, "PR_REVIEW_LOGIN") or "@me"
+    raw = resolve(settings, "PR_POLL_INTERVAL_S")
+    try:
+        interval = float(raw) if raw else 60.0
+    except ValueError:
+        log.warning("PR_POLL_INTERVAL_S=%r is not a number; using 60", raw)
+        interval = 60.0
+    return channel, login, interval
+
+
 async def main() -> None:
     central_dispatch = resolve_central_dispatch()
     preflight()
@@ -870,9 +938,26 @@ async def main() -> None:
         if not ws_url or not ws_token:
             sys.exit("Central-Dispatch did not return WebSocket details")
 
-        sessions = build_session_manager()
+        settings = load_settings()
+        sessions = build_session_manager(settings)
         sessions.start_reaper()
         slack = AsyncWebClient(token=slack_token)
+
+        # PR review poller. Off unless PR_REVIEW_CHANNEL is set — the same
+        # "unconfigured means no-op" shape as Central's email poller.
+        pr_channel, pr_login, pr_interval = pr_poller_config(settings)
+        poller: Optional[pr_poller.PRPoller] = None
+        if pr_channel:
+            async def on_pr_review_requested(pr: pr_poller.PR) -> None:
+                await handle_pr_review_request(pr, pr_channel, sessions, slack)
+
+            # Constructed here but started inside the try below, so the finally
+            # that stops it covers every path on which it is running.
+            poller = pr_poller.PRPoller(
+                login=pr_login, on_new=on_pr_review_requested, interval_s=pr_interval
+            )
+        else:
+            log.info("PR review poller disabled (set PR_REVIEW_CHANNEL to enable)")
 
         # Wake threads when a background sub-agent finishes (see the
         # "Background-task flush" section above). thread_key -> the task holding
@@ -932,9 +1017,16 @@ async def main() -> None:
                 await dispatch_event(payload, sessions, slack)
 
         try:
+            if poller is not None:
+                poller.start()
             await consume(http, ws_url, ws_token, on_event, stop)
         finally:
             log.info("shutting down")
+            # Stop the poller before the sessions: the other order lets a review
+            # turn keep streaming into a session whose subprocess was just
+            # killed, which surfaces as a spurious error in Slack on every exit.
+            if poller is not None:
+                await poller.stop()
             await sessions.close_all()
 
 
