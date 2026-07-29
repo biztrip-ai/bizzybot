@@ -877,7 +877,13 @@ async def consume(
                 if inflight:
                     await asyncio.gather(*inflight, return_exceptions=True)
         except aiohttp.ClientError as e:
-            log.warning("Central-Dispatch connection error: %s", e)
+            # aiohttp formats ClientResponseError with the full request URL, and
+            # ours carries ?token=… — so logging `e` raw would write a live
+            # Central-Dispatch credential into this run's log file, on every
+            # retry. Ephemeral on stderr; not in a file that is never pruned and
+            # sits in the same home dir as a bypassPermissions agent.
+            detail = str(e).replace(ws_token, "***") if ws_token else str(e)
+            log.warning("Central-Dispatch connection error: %s", detail)
 
         if stop.is_set():
             return
