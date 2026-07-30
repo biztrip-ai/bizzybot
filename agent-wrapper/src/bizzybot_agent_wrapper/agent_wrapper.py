@@ -856,11 +856,37 @@ async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWeb
 
 class Cursor:
     """Tracks the highest *contiguous* sequence number fully processed, so we ack
-    (and resume from) exactly that point even when events finish out of order."""
+    (and resume from) exactly that point even when events finish out of order.
+
+    Where we start counting is only ever a guess: our persisted position, or 0 if
+    that state was never written or was lost (a reinstall, a wiped state dir).
+    Central-Dispatch numbers events from a per-agent counter that has been
+    climbing since registration, so the guess can sit far below the first seq we
+    are actually sent — and then "contiguous" waits forever for a seq that will
+    never arrive: nothing is ever acked, Central-Dispatch never prunes its log,
+    and every reconnect replays the whole backlog into fresh Claude turns.
+    `observe` pins the baseline to what the server really sends instead."""
 
     def __init__(self, last: int):
         self.contiguous = last
         self._done: set[int] = set()
+        self._based = False
+
+    def observe(self, seq: int) -> Optional[int]:
+        """Adopt the first seq delivered on a connection as the baseline, before
+        it is processed. Events arrive in ascending seq order (replay is ordered,
+        live pushes follow it), so the first one lower-bounds everything we could
+        still be sent: anything below it the server has already accounted for —
+        acked and pruned, or dropped by its staleness failsafe — so waiting on it
+        would wedge us forever. Only ever moves the cursor forward. Returns the
+        new baseline if it jumped, else None (for logging)."""
+        if self._based:
+            return None
+        self._based = True
+        if seq - 1 > self.contiguous:
+            self.contiguous = seq - 1
+            return self.contiguous
+        return None
 
     def complete(self, seq: int) -> Optional[int]:
         """Mark seq done. Return the new contiguous high-water mark if it moved."""
@@ -944,6 +970,15 @@ async def consume(
                         except ValueError:
                             continue
                         if data.get("type") == "event" and isinstance(data.get("seq"), int):
+                            # Baseline before processing, so the first event's own
+                            # ack can move the cursor (and get persisted).
+                            rebased = cursor.observe(data["seq"])
+                            if rebased is not None:
+                                log.info(
+                                    "delivery cursor rebased to %d (local state was behind "
+                                    "Central-Dispatch's log)",
+                                    rebased,
+                                )
                             t = asyncio.create_task(
                                 process(data["seq"], data.get("event") or {})
                             )
