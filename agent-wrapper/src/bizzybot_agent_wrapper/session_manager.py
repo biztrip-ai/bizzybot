@@ -85,6 +85,16 @@ def load_cli_mcp_servers(cwd: Optional[str] = None) -> dict[str, dict]:
 # fresh session there — handled in Session._ensure_connected.)
 _SESSION_STORE = state_path("sessions.json")
 
+# How far a ResultMessage's self-reported `duration_ms` may exceed the time we
+# have actually spent waiting for it before we call the stream desynced. A turn
+# cannot have taken longer than the prompt has existed, so any real excess means
+# the result was produced before our prompt was sent — i.e. it belongs to an
+# earlier turn. The slack absorbs clock granularity and the gap between the CLI
+# starting its timer and our `query()` returning, both sub-millisecond in
+# practice; a genuine skew is a whole turn wide (seconds), so this is not a
+# close call in either direction.
+_RESULT_SKEW_TOLERANCE_MS = 1_000
+
 # Prepended to the first prompt after a resume so the agent re-orients instead of
 # acting like a brand-new conversation (the prior transcript is already loaded).
 _RESUME_PRIMER = (
@@ -231,6 +241,11 @@ class Session:
             stream = self._client.receive_response()
             complete = False   # saw our ResultMessage — nothing left to drain
             exhausted = False  # stream ended on its own — nothing left to drain
+            # Wall-clock floor for this turn: nothing the CLI reports as ours can
+            # predate it. Checked against the ResultMessage's `duration_ms` below,
+            # which is the only self-consistency test available on a stream whose
+            # messages carry no turn identity.
+            sent_at = time.monotonic()
             try:
                 await self._client.query(prompt)
                 async for msg in stream:
@@ -326,12 +341,43 @@ class Session:
                         duration = getattr(msg, "duration_ms", None)
                         cost = getattr(msg, "total_cost_usd", None)
                         usage = getattr(msg, "usage", None)
+                        # `subtype`, `num_turns` and `uuid` are the only fields on
+                        # a ResultMessage that say anything about *which* turn it
+                        # is (it carries no `parent_tool_use_id`, unlike every
+                        # other message type). We can't correlate on them yet —
+                        # `num_turns`' semantics are unconfirmed — but they cost
+                        # nothing to log and are what a real fix would key on.
+                        subtype = getattr(msg, "subtype", None)
+                        num_turns = getattr(msg, "num_turns", None)
+                        result_uuid = getattr(msg, "uuid", None)
+                        elapsed_ms = (time.monotonic() - sent_at) * 1000
                         self.log.info(
-                            "turn %d: result is_error=%s duration_ms=%s cost_usd=%s "
-                            "usage=%s",
-                            turn, is_err, duration, cost,
+                            "turn %d: result subtype=%s num_turns=%s uuid=%s "
+                            "is_error=%s duration_ms=%s elapsed_ms=%d "
+                            "cost_usd=%s usage=%s",
+                            turn, subtype, num_turns, result_uuid,
+                            is_err, duration, round(elapsed_ms), cost,
                             _truncate(repr(usage), 200) if usage else None,
                         )
+                        # One-sided on purpose: elapsed > duration is ordinary
+                        # (our prompt can sit queued behind other work in the CLI,
+                        # and we spend time rendering chunks). duration > elapsed
+                        # is not physically possible for our own turn.
+                        if (
+                            duration is not None
+                            and duration - elapsed_ms > _RESULT_SKEW_TOLERANCE_MS
+                        ):
+                            self.log.error(
+                                "turn %d: result reports duration_ms=%s but only "
+                                "%d ms have passed since the prompt was sent — it "
+                                "was produced before we asked, so it answers an "
+                                "earlier turn and every later reply on this "
+                                "session is shifted onto the wrong prompt "
+                                "(subtype=%s num_turns=%s uuid=%s); !clear to "
+                                "reset it",
+                                turn, duration, round(elapsed_ms),
+                                subtype, num_turns, result_uuid,
+                            )
                         parts: list[str] = []
                         if is_err:
                             parts.append(f"ERROR: {getattr(msg, 'result', '')}")
@@ -375,6 +421,16 @@ class Session:
                     saw_result = True
                     self._capture_session_id(getattr(msg, "session_id", None))
                     self._last_used_at = time.monotonic()
+                    # The other place a result is swallowed without reaching
+                    # Slack. Identify it for the same reason as in `send()`.
+                    self.log.info(
+                        "turn %d: drained result subtype=%s num_turns=%s "
+                        "uuid=%s duration_ms=%s",
+                        turn, getattr(msg, "subtype", None),
+                        getattr(msg, "num_turns", None),
+                        getattr(msg, "uuid", None),
+                        getattr(msg, "duration_ms", None),
+                    )
         except Exception:  # noqa: BLE001
             self.log.exception(
                 "turn %d: drain failed after %d message(s) — this session's "
