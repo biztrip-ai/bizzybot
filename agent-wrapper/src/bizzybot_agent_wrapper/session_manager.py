@@ -95,6 +95,18 @@ _SESSION_STORE = state_path("sessions.json")
 # close call in either direction.
 _RESULT_SKEW_TOLERANCE_MS = 1_000
 
+# Pushed onto `Session._inbox` once the pump stops, so a turn blocked on the
+# queue wakes instead of waiting for a message the CLI will never send. Sticky:
+# every reader puts it back, because the end of the stream is not one reader's
+# news.
+_INBOX_CLOSED = object()
+
+# Log the inbox depth each time it crosses a multiple of this. The queue is
+# unbounded on purpose (see `Session._pump`), which trades a deadlock for
+# unbounded memory — a large backlog is no longer fatal but is still worth
+# seeing, since it means turns are not keeping up with the CLI.
+_INBOX_DEPTH_LOG_EVERY = 500
+
 # Prepended to the first prompt after a resume so the agent re-orients instead of
 # acting like a brand-new conversation (the prior transcript is already loaded).
 _RESUME_PRIMER = (
@@ -162,6 +174,57 @@ class Session:
         # Monotonic timestamp of the last turn activity — used by the reaper to
         # evict sessions idle longer than the TTL.
         self._last_used_at = time.monotonic()
+        # Everything the CLI has said that no turn has read yet. `_pump` fills
+        # it for the session's whole life; `send()` and `_drain()` are its only
+        # readers. Unbounded on purpose — see `_pump` for why a bound here is
+        # the very thing that broke.
+        self._inbox: asyncio.Queue = asyncio.Queue()
+        # True once the pump for the *current* inbox has stopped. The durable
+        # record of end-of-stream; `_INBOX_CLOSED` is only the token that wakes
+        # a reader already blocked on the queue. If no reader is blocked the
+        # token sits there unread, so `_close_token_queued` keeps `_backlog()`
+        # from counting it as a message the CLI actually sent.
+        self._inbox_closed = False
+        self._close_token_queued = False
+        self._pump_task: Optional[asyncio.Task] = None
+        # Why the pump stopped, if it stopped for a reason. Reported (as the
+        # cause of a fresh error) to whichever turn next reads the inbox, so a
+        # dead CLI surfaces as that turn's error instead of a hang.
+        self._pump_error: Optional[BaseException] = None
+        # Messages the pump took while no turn held the lock, i.e. output the
+        # CLI produced without us prompting for it. Reported at the start of the
+        # next turn, and the measurement that says whether the SubagentStop
+        # flush turn is still earning its keep.
+        self._idle_messages = 0
+        # ResultMessages sitting unread in `_inbox`. A turn that starts with
+        # this above zero is about to read someone else's answer — the exact
+        # shift the `duration_ms` check below catches after the fact.
+        self._queued_results = 0
+        self._inbox_depth_logged_at = 0
+        # True only while a prompt is actually outstanding with the CLI. Not the
+        # same as "the lock is held": `send()` holds the lock across Slack I/O
+        # both before `query()` and after the result, and output arriving in
+        # those windows is unsolicited. The lock would call it solicited and
+        # undercount `_idle_messages`, which is the number the flush-turn
+        # decision rests on.
+        self._turn_active = False
+        # Set by `close()` and never cleared. Every caller of `close()` has
+        # already dropped this session from the manager's table, so nothing will
+        # ever close it again — a turn that reconnected here would leave a
+        # `claude` subprocess and a pump nobody owns, running for the life of
+        # the process. A turn holding the lock across `close()` is exactly how
+        # that happens, since `drop()` does not wait for one.
+        self._closed = False
+
+    def _backlog(self) -> int:
+        """Unread messages the CLI actually sent.
+
+        Not `_inbox.qsize()`: the close token is our own bookkeeping, and
+        counting it would report a one-message backlog on every turn after the
+        pump stops — telling the user their replies are shifted when nothing of
+        the CLI's is waiting at all.
+        """
+        return self._inbox.qsize() - (1 if self._close_token_queued else 0)
 
     @property
     def next_turn_number(self) -> int:
@@ -187,6 +250,12 @@ class Session:
                     self.log.warning("could not persist session id", exc_info=True)
 
     async def _ensure_connected(self) -> None:
+        if self._closed:
+            raise RuntimeError(
+                "this session was closed while the turn was starting (!clear, "
+                "idle eviction, or shutdown) — send the message again to open a "
+                "new one"
+            )
         if self._connected:
             return
         self.log.info("connecting claude subprocess%s", " (resume)" if self._resumed else "")
@@ -203,7 +272,154 @@ class Session:
             self._client = ClaudeSDKClient(options=replace(self._options, resume=None))
             await self._client.connect()
         self._connected = True
+        self._start_pump()
         self.log.info("connected")
+
+    def _start_pump(self) -> None:
+        if self._pump_task is not None and not self._pump_task.done():
+            return
+        # A reconnect is a new subprocess with a new stream, so the old inbox is
+        # not this pump's. Reusing it would carry the dead pump's end-of-stream
+        # state into a live session and hide every message the new pump queues.
+        # Safe to rebind here: `_next_message` only ever runs on the task that
+        # holds `_lock`, and that is the task calling this.
+        leftover = self._backlog()
+        if leftover > 0:
+            self.log.warning(
+                "reconnecting: discarding %d unread message(s) from the "
+                "previous connection (%d result(s) among them)",
+                leftover, self._queued_results,
+            )
+        self._inbox = asyncio.Queue()
+        self._inbox_closed = False
+        self._close_token_queued = False
+        self._pump_error = None
+        self._idle_messages = 0
+        self._queued_results = 0
+        self._inbox_depth_logged_at = 0
+        self._pump_task = asyncio.create_task(self._pump(), name=f"pump[{self.key}]")
+
+    async def _pump(self) -> None:
+        """Move messages off the SDK's bounded buffer as fast as they arrive.
+
+        The SDK hands messages over a 100-slot memory stream, filled by a single
+        reader task that *also* dispatches control requests — hook callbacks
+        among them. Before this existed, that stream was read only while a turn
+        was in flight, so nothing emptied it between turns. Sub-agents launched
+        by an earlier turn keep talking regardless, and once 100 of their
+        messages went unread the SDK's reader blocked on its own `send()`,
+        taking SubagentStop down with it. The hook is what schedules the flush
+        turn that would have drained the stream, so the two wedged against each
+        other: nothing could read until a hook fired, and no hook could fire
+        until something read.
+
+        Seen in #bizzy-bot on 2026-08-03 as a 64-minute silence in the middle of
+        a five-trip review — four sub-agents finishing into a full buffer, no
+        wake-up possible. A user typing into the thread was what broke it, and
+        every reply for the rest of the session answered a prompt four turns
+        back.
+
+        Running for the session's whole life is the whole point: tying this to a
+        turn reopens the exact gap it exists to close. The queue it fills is
+        unbounded for the same reason — any bound is another place the CLI can
+        wedge behind us, and holding messages costs memory where dropping them
+        costs a deadlock.
+        """
+        stopped_cleanly = False
+        try:
+            async for msg in self._client.receive_messages():
+                if isinstance(msg, ResultMessage):
+                    self._queued_results += 1
+                if not self._turn_active:
+                    # No prompt is outstanding, so nothing asked for this.
+                    # Counted rather than acted on: reporting finished work is
+                    # the flush turn's job, and this is only the evidence for
+                    # whether that job is still needed.
+                    self._idle_messages += 1
+                self._inbox.put_nowait(msg)
+                self._log_depth()
+            stopped_cleanly = True
+        except asyncio.CancelledError:
+            stopped_cleanly = True
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._pump_error = e
+            self.log.exception(
+                "pump stopped on error after %d queued message(s); this "
+                "session can no longer hear the CLI and every later turn will "
+                "fail fast rather than hang", self._backlog(),
+            )
+        finally:
+            if stopped_cleanly and self._pump_error is None:
+                self.log.info(
+                    "pump stopped; %d message(s) left unread", self._backlog()
+                )
+            # Flag first, then the token: a reader blocked on `get()` needs
+            # waking, and it re-checks the flag once woken. A reader that
+            # arrives later reads the flag directly and never sees the token.
+            self._inbox_closed = True
+            self._close_token_queued = True
+            self._inbox.put_nowait(_INBOX_CLOSED)
+
+    def _log_depth(self) -> None:
+        depth = self._backlog()
+        if depth < self._inbox_depth_logged_at + _INBOX_DEPTH_LOG_EVERY:
+            return
+        self._inbox_depth_logged_at = depth - (depth % _INBOX_DEPTH_LOG_EVERY)
+        self.log.warning(
+            "inbox depth %d (%d unread result(s)) — turns are not keeping up "
+            "with the CLI; replies are shifted onto earlier prompts by that "
+            "much and memory grows until they catch up",
+            depth, self._queued_results,
+        )
+
+    async def _next_message(self):
+        """The next message the CLI sent, or None once its stream has ended.
+
+        Raises if the pump died, chaining whatever killed it, so a dead CLI
+        reaches the turn that needs it instead of leaving that turn waiting on a
+        queue nobody fills.
+        """
+        while True:
+            # Only an *empty* closed inbox is the end. The pump sets the flag
+            # while its last messages are still queued, and those still belong
+            # to whichever turn asked for them.
+            if self._inbox_closed and self._backlog() <= 0:
+                if self._pump_error is not None:
+                    # A new exception rather than the stored one: re-raising the
+                    # same instance grows its traceback on every later read and
+                    # keeps every frame's locals alive with it.
+                    raise RuntimeError(
+                        "the CLI's message stream has ended; this session can no "
+                        "longer be used"
+                    ) from self._pump_error
+                return None
+            msg = await self._inbox.get()
+            if msg is _INBOX_CLOSED:
+                # Just the wake-up token. `_inbox_closed` is the real record, so
+                # drop it and re-check above rather than putting it back, where
+                # it would rotate ahead of every later message.
+                self._close_token_queued = False
+                continue
+            if isinstance(msg, ResultMessage):
+                self._queued_results -= 1
+            self._inbox_depth_logged_at = min(
+                self._inbox_depth_logged_at, self._backlog()
+            )
+            return msg
+
+    async def _stop_pump(self) -> None:
+        task, self._pump_task = self._pump_task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise  # our own cancellation, not the pump's — don't swallow it
+        except Exception:  # noqa: BLE001 — already logged by the pump itself
+            self.log.debug("pump raised while stopping", exc_info=True)
 
     async def send(self, prompt: str) -> AsyncIterator[Chunk]:
         async with self._lock:
@@ -225,20 +441,31 @@ class Session:
                 "turn %d: user prompt (%d chars): %r",
                 turn, len(prompt), _truncate(prompt, 200),
             )
-            # `receive_response()` reads the CLI's shared message stream up to the
-            # next ResultMessage — nothing in it ties a message back to the query
-            # that produced it. Pairing rests entirely on each turn consuming its
-            # own messages to the end: anything left behind is read by the *next*
-            # turn as its own answer, silently shifting every later reply onto the
-            # wrong prompt for the rest of the session. Our consumer can vanish at
-            # any yield below (an exception in its loop body closes this
-            # generator), so the drain runs from a finally, before the lock is
-            # released.
+            # The inbox holds the CLI's messages in arrival order and nothing in
+            # them ties a message back to the query that produced it. Pairing
+            # rests entirely on each turn consuming its own messages to the end:
+            # anything left behind is read by the *next* turn as its own answer,
+            # silently shifting every later reply onto the wrong prompt for the
+            # rest of the session. Our consumer can vanish at any yield below (an
+            # exception in its loop body closes this generator), so the drain runs
+            # from a finally, before the lock is released.
             #
             # query() is inside the try: once the prompt reaches the CLI's stdin
             # the turn exists and will produce messages, so from that await
             # onwards there is always something to drain.
-            stream = self._client.receive_response()
+            backlog = self._backlog()
+            if backlog > 0:
+                # Said before the turn runs rather than inferred from its result
+                # afterwards: at this point the shift is a fact about the queue,
+                # not a deduction from a suspicious duration.
+                self.log.warning(
+                    "turn %d: %d message(s) were already queued before this "
+                    "prompt (%d arrived while idle, %d completed result(s) among "
+                    "them) — this turn reads those first, so its reply may answer "
+                    "an earlier prompt; !clear to reset it",
+                    turn, backlog, self._idle_messages, self._queued_results,
+                )
+            self._idle_messages = 0
             complete = False   # saw our ResultMessage — nothing left to drain
             exhausted = False  # stream ended on its own — nothing left to drain
             # Wall-clock floor for this turn: nothing the CLI reports as ours can
@@ -247,8 +474,13 @@ class Session:
             # messages carry no turn identity.
             sent_at = time.monotonic()
             try:
+                self._turn_active = True
                 await self._client.query(prompt)
-                async for msg in stream:
+                while True:
+                    msg = await self._next_message()
+                    if msg is None:
+                        exhausted = True
+                        break
                     if isinstance(msg, AssistantMessage):
                         # A sub-agent's own messages arrive on this same stream,
                         # tagged with the tool_use id of the Task that spawned
@@ -391,12 +623,16 @@ class Session:
                         complete = True
                         yield Chunk("result", " ".join(parts), is_error=bool(is_err))
                         return
-                exhausted = True
             finally:
-                if not complete and not exhausted:
-                    await self._drain(stream, turn)
+                # Cleared after the drain, not before it: what the drain reads
+                # is still this turn's output, not idle chatter.
+                try:
+                    if not complete and not exhausted:
+                        await self._drain(turn)
+                finally:
+                    self._turn_active = False
 
-    async def _drain(self, stream: AsyncIterator, turn: int) -> None:
+    async def _drain(self, turn: int) -> None:
         """Consume the rest of a turn's messages after our consumer went away.
 
         Reaching here means something aborted the turn early — a Slack failure
@@ -405,14 +641,27 @@ class Session:
         instead of this one's leftovers.
 
         Reaching the ResultMessage is what makes the stream safe again. If we
-        can't (the stream was closed under us, which is what a cancellation
-        delivered inside `stream.__anext__()` does), the leftovers survive and
-        the next turn will read them — so that case is logged at ERROR rather
-        than passing quietly as a zero-length drain."""
+        can't (the pump died, so no further message is coming), the leftovers
+        survive and the next turn will read them — so that case is logged at
+        ERROR rather than passing quietly as a zero-length drain."""
+        if self._inbox_closed and self._backlog() <= 0:
+            # The pump is already gone and left nothing behind, so there is
+            # nothing to align. Reading here would only re-raise the pump's own
+            # failure and log it a second time as a drain failure, which reads
+            # as a fresh desync when it is the same one already reported.
+            self.log.error(
+                "turn %d: the CLI's stream ended mid-turn; nothing left to "
+                "drain — this session is finished, !clear to start a new one",
+                turn,
+            )
+            return
         count = 0
         saw_result = False
         try:
-            async for msg in stream:
+            while True:
+                msg = await self._next_message()
+                if msg is None:
+                    break
                 count += 1
                 if isinstance(msg, SystemMessage):
                     data = getattr(msg, "data", {}) or {}
@@ -431,6 +680,11 @@ class Session:
                         getattr(msg, "uuid", None),
                         getattr(msg, "duration_ms", None),
                     )
+                    # Stop at the result, not at the end of the inbox: this
+                    # turn owns everything up to its own result and nothing
+                    # after it. `receive_response()` used to end the loop here
+                    # by itself; reading a shared queue means saying so.
+                    break
         except Exception:  # noqa: BLE001
             self.log.exception(
                 "turn %d: drain failed after %d message(s) — this session's "
@@ -451,9 +705,17 @@ class Session:
             )
 
     async def close(self) -> None:
+        # Marked before the awaits below: a turn parked mid-`send()` must not
+        # slip past `_ensure_connected` and reconnect while we are shutting the
+        # old connection down.
+        self._closed = True
         if self._connected:
             self.log.info("disconnecting")
             try:
+                # Pump first: it is the only reader of the SDK's stream, and
+                # disconnecting under it turns an ordinary shutdown into a
+                # logged pump error.
+                await self._stop_pump()
                 await self._client.disconnect()
             finally:
                 self._connected = False
