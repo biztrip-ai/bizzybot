@@ -172,6 +172,14 @@ export function buildManifest({ appName, baseUrl }) {
     display_information: { name: appName },
     features: {
       bot_user: { display_name: appName, always_online: true },
+      // Without app_home, Slack creates the app with DMs disabled ("Sending
+      // messages to this app has been turned off") and it must be fixed by
+      // hand per app (App Home → Messages Tab) — see issue #1.
+      app_home: {
+        home_tab_enabled: false,
+        messages_tab_enabled: true,
+        messages_tab_read_only_enabled: false,
+      },
     },
     oauth_config: {
       redirect_urls: [`${baseUrl}/slack/oauth/callback`, `${baseUrl}/auth/slack/callback`],
