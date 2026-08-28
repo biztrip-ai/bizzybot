@@ -817,7 +817,6 @@ async def handle_sentry_issue(
             "Sentry announce failed for %s in channel %s — is SENTRY_WATCH_CHANNEL a "
             "channel id the bot has been invited to?", p.short_id, channel,
         )
-        # No Claude turn started; the poller may safely release its claim.
         raise sentry_poller.TriageNotStarted from exc
     thread_ts = resp["ts"]
 
@@ -829,8 +828,6 @@ async def handle_sentry_issue(
         "files": [],
     }
     if not await handle_user_message(synth, sessions, slack):
-        # The announce stands but no investigation ran; the poller retries a
-        # bounded number of times rather than burying the issue as handled.
         raise sentry_poller.TriageTurnFailed(group.primary.short_id)
 
 

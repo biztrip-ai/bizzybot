@@ -2,10 +2,9 @@
 
 When a new issue appears, fires an async callback so the wrapper can open a
 Slack thread and run a Claude turn that triages it (the `sentry-triage` skill
-in the btdash checkout does the investigation and any Jira filing).
-
-Polls the Sentry REST API directly with a read-only token from
-``~/.bizzybot/settings.env`` (``SENTRY_API_TOKEN``). Credentialed polling
+in the btdash checkout does the investigation and any Jira filing). Polls the
+Sentry REST API directly with a read-only token from
+``~/.bizzybot/settings.env`` (``SENTRY_API_TOKEN``); credentialed polling
 lives in the agent-wrapper for the same reason the PR poller's does:
 Central-Dispatch holds no Sentry credential.
 
@@ -26,32 +25,12 @@ moment. The ledger gives each issue a phase:
   * ``failed`` — MAX_TRIAGE_ATTEMPTS dispatches failed. Logged loudly, never
     auto-fired again; a human triages it by hand.
   * ``completed`` — the triage turn ran to the end, or the entry was seeded.
+    Re-fires once per regression episode: the ledger remembers which
+    ``substatus`` it last fired on, clearing that memory when the issue is
+    next seen healthy.
   * ``listed`` — surfaced in a storm rollup but not auto-triaged; a human
     triages it by hand from the rollup checklist. Never auto-fired again,
     including on regression.
-
-First run (no ledger file) seeds: every currently-unresolved issue — paged
-through in full, not just the first page — is recorded ``completed`` and
-nothing fires, so enabling the feature doesn't dump the backlog into Slack.
-A resolved issue that comes back is re-fired once per regression episode:
-Sentry marks it ``substatus=regressed``, and the ledger remembers which
-substatus it last fired on, clearing that memory when the issue is next seen
-healthy.
-
-Issues sharing a culprit within one poll are grouped into a single fire — one
-defect routinely produces two or more issues within minutes (an explicit
-``logger.error`` plus the re-raised exception, say), and two threads for one
-bug splits the conversation.
-
-A poll that finds more than MAX_FIRES_PER_POLL new groups is a storm (a bad
-deploy, typically). Instead of opening one thread per issue, the poller fires
-the rollup callback once with the whole batch; the wrapper posts a single
-message, the top MAX_STORM_TRIAGE groups by impact are auto-triaged, and the
-rest are recorded ``listed``.
-
-``_fetch`` distinguishes "the API call failed" (None) from "no unresolved
-issues" ([]) for the same reason the PR poller does: a failed fetch read as an
-empty queue would make the next successful poll fire on everything at once.
 """
 
 from __future__ import annotations
@@ -82,15 +61,12 @@ LEDGER_FILE = "sentry-watch-ledger.json"
 # code always sets one of local/test/ci/dev/staging/prod.
 SEARCH_QUERY = "is:unresolved environment:prod level:error"
 
-# The poll interval floor exists to protect the shared org rate limit, not
-# responsiveness — at the default 15min a burst of new issues still reaches
-# Slack the same quarter-hour it reaches Sentry (triage turns then run
-# serially, so a large burst finishes later than it starts).
+# The poll interval floor protects the shared org rate limit, not
+# responsiveness.
 DEFAULT_INTERVAL_S = 900.0
 MIN_INTERVAL_S = 60.0
 
-# A Retry-After above this is a misbehaving server, not advice worth taking:
-# honoring an unbounded (or inf/nan) value would park the watch until restart.
+# A Retry-After above this is a misbehaving server, not advice worth taking.
 MAX_RETRY_AFTER_S = 3600.0
 
 FETCH_TIMEOUT_S = 60.0
@@ -108,8 +84,8 @@ MAX_TRIAGE_ATTEMPTS = 2
 
 PAGE_LIMIT = 100
 
-# Seeding pages through the whole unresolved queue so nothing later fires as
-# fake-new; this cap only bounds a pathological queue (>2000 issues).
+# Caps seeding's pagination; only a pathological unresolved queue
+# (>2000 issues) hits it.
 MAX_SEED_PAGES = 20
 
 
@@ -256,9 +232,11 @@ def parse_issues(items: list) -> list[SentryIssue]:
 
 
 def group_by_culprit(issues: list[SentryIssue]) -> list[IssueGroup]:
-    """Same culprit in one batch = one defect = one fire. Issues with no
-    culprit are never grouped with each other — an empty string matching an
-    empty string is coincidence, not kinship."""
+    """Same culprit in one batch = one defect = one fire — one defect routinely
+    produces two or more issues within minutes (an explicit ``logger.error``
+    plus the re-raised exception, say). Issues with no culprit are never
+    grouped with each other: an empty string matching an empty string is
+    coincidence, not kinship."""
     by_culprit: dict[str, list[SentryIssue]] = {}
     loners: list[SentryIssue] = []
     for issue in issues:
@@ -315,9 +293,6 @@ class Ledger:
                 json.dump({"issues": self._issues}, f)
             os.replace(tmp, self._path)
         except OSError:
-            # In-memory state stays correct for this process; the cost of a
-            # lost save is a possible duplicate fire after restart, which the
-            # triage skill's Jira dedup absorbs.
             log.warning("could not persist ledger %s", self._path, exc_info=True)
 
     def phase(self, issue_id: str) -> Optional[str]:
@@ -392,10 +367,8 @@ class SentryPoller:
             interval_s = MIN_INTERVAL_S
         self._interval_s = interval_s
         self._ledger = ledger if ledger is not None else Ledger()
-        # `announced` entries are a crashed run's possibly-lost investigations.
-        # They are re-offered exactly once, on the first successful poll after
-        # startup — re-offering on every poll would turn any persistent
-        # dispatch failure into an announce per interval for weeks.
+        # `announced` entries (a crashed run's possibly-lost investigations)
+        # are re-offered once, on the first poll only — see the phase table.
         self._reoffer_announced = True
         self._fetch_failures = 0
         self._retry_after_s = 0.0
@@ -438,7 +411,7 @@ class SentryPoller:
             log.warning("Sentry poller did not stop within %gs; abandoning it", timeout)
 
     def _select_new(self, issues: list[SentryIssue]) -> list[SentryIssue]:
-        """The dedup contract, pure with respect to I/O.
+        """The dedup contract.
 
         New = never in the ledger, awaiting a retry, stuck at ``announced``
         (startup re-offer only), or a ``completed`` issue that regressed since
@@ -469,10 +442,8 @@ class SentryPoller:
 
     async def _loop(self) -> None:
         async with aiohttp.ClientSession() as http:
-            # Seed until a full paged fetch genuinely succeeds; nothing fires
-            # before the ledger holds a complete picture of the unresolved
-            # queue — a one-page seed would let the unseeded remainder fire
-            # later as fake-new.
+            # Nothing fires until a full paged fetch succeeds and seeds the
+            # ledger with the complete unresolved queue.
             while not self._ledger.existed:
                 try:
                     issues = await self._fetch_all_pages(http)
@@ -526,9 +497,8 @@ class SentryPoller:
         )
         attempts = self._ledger.attempts(p.id) + 1
         # Claim before firing: a turn that fails half-way may already have
-        # posted to Slack or filed a ticket. Retries are bounded and safe —
-        # the triage skill dedups against Jira before filing — and the startup
-        # re-offer of `announced` entries covers the crash case.
+        # posted to Slack or filed a ticket; the startup re-offer of
+        # `announced` entries covers the crash case.
         self._ledger.record_group(group.issues, "announced", attempts)
         try:
             await self._on_new(group)
@@ -540,9 +510,8 @@ class SentryPoller:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — one bad issue mustn't kill the loop
-            # TriageTurnFailed and any unexpected dispatch error land here: the
-            # turn did not complete. Bounded retry, then a loud hand-off — an
-            # environment that keeps failing dispatches won't be fixed by more.
+            # TriageTurnFailed and any unexpected dispatch error land here:
+            # the turn did not complete.
             if attempts >= MAX_TRIAGE_ATTEMPTS:
                 self._ledger.record_group(group.issues, "failed", attempts)
                 log.error(
@@ -593,9 +562,10 @@ class SentryPoller:
         """First page of unresolved prod issues, or None if the call failed.
 
         One page suffices at steady state — the poll delta is a handful of
-        issues — and the full-page warning below flags it if that stops being
-        true. None and [] are deliberately different, exactly as in the PR
-        poller.
+        issues — and a full page logs a warning when that stops being true.
+        None and [] are deliberately different, as in the PR poller: a failed
+        fetch read as an empty queue would make the next successful poll fire
+        on everything at once.
         """
         page = await self._fetch_page(http)
         if page is None:
