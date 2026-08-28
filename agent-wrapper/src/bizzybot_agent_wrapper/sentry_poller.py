@@ -570,7 +570,7 @@ class SentryPoller:
         page = await self._fetch_page(http)
         if page is None:
             return None
-        issues, has_more = page
+        issues, has_more, _ = page
         if has_more:
             log.warning(
                 "Sentry returned a full page (%d) of unresolved issues; issues "
