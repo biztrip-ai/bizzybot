@@ -427,7 +427,11 @@ def normalize_slack_event(
 
 async def handle_user_message(
     payload: dict[str, Any], sessions: SessionManager, slack: AsyncWebClient
-) -> None:
+) -> bool:
+    """Returns False when the Claude turn raised (the thread shows a warning in
+    that case); True otherwise. Most callers ignore this — the Sentry triage
+    path uses it to retry rather than record a crashed turn as handled."""
+    turn_ok = True
     thread_key = payload.get("thread_key")
     channel = payload.get("channel")
     reply_ts = payload.get("reply_thread_ts")
@@ -435,7 +439,7 @@ async def handle_user_message(
     files = payload.get("files") or []
     if not thread_key or not channel or (not text and not files):
         log.warning("skipping message missing thread_key/channel/text")
-        return
+        return True
 
     if files:
         local = await download_slack_files(files, slack.token or "")
@@ -502,6 +506,7 @@ async def handle_user_message(
             else:
                 await renderer.replace_with("_nothing new to report_")
     except Exception as e:  # noqa: BLE001 — surface any turn failure to Slack
+        turn_ok = False
         log.exception("session error on %s", thread_key)
         await renderer.replace_with(f":warning: error: `{e}`")
 
@@ -515,6 +520,7 @@ async def handle_user_message(
     email_ctx = payload.get("_email")
     if email_ctx:
         await _send_email_reply(email_ctx, joined, channel, reply_ts, slack)
+    return turn_ok
 
 
 # --- Background-task flush --------------------------------------------------
@@ -789,14 +795,10 @@ async def handle_sentry_issue(
     channel: str,
     sessions: SessionManager,
     slack: AsyncWebClient,
-    parent_ts: Optional[str] = None,
 ) -> None:
     """A new production Sentry issue appeared: announce it in the configured
     channel, then run a Claude turn in that thread which triages it via the
     sentry-triage skill (investigation, and Jira filing when proven).
-
-    `parent_ts` threads the announce under a storm rollup message instead of
-    posting a fresh channel message.
     """
     p = group.primary
     link = f"<{p.permalink}|{p.short_id}>"
@@ -809,9 +811,7 @@ async def handle_sentry_issue(
         f"> {p.count} event(s), {p.user_count} user(s) — `{_slack_escape(p.culprit)}`"
     )
     try:
-        resp = await slack.chat_postMessage(
-            channel=channel, thread_ts=parent_ts, text=announce
-        )
+        resp = await slack.chat_postMessage(channel=channel, text=announce)
     except Exception as exc:  # noqa: BLE001 — contained by the poll loop
         log.exception(
             "Sentry announce failed for %s in channel %s — is SENTRY_WATCH_CHANNEL a "
@@ -819,7 +819,7 @@ async def handle_sentry_issue(
         )
         # No Claude turn started; the poller may safely release its claim.
         raise sentry_poller.TriageNotStarted from exc
-    thread_ts = parent_ts or resp["ts"]
+    thread_ts = resp["ts"]
 
     synth = {
         "thread_key": f"{channel}:{thread_ts}",
@@ -828,7 +828,10 @@ async def handle_sentry_issue(
         "text": sentry_poller.build_triage_instruction(group),
         "files": [],
     }
-    await handle_user_message(synth, sessions, slack)
+    if not await handle_user_message(synth, sessions, slack):
+        # The announce stands but no investigation ran; the poller retries a
+        # bounded number of times rather than burying the issue as handled.
+        raise sentry_poller.TriageTurnFailed(group.primary.short_id)
 
 
 async def handle_sentry_rollup(
@@ -850,7 +853,7 @@ async def handle_sentry_rollup(
 
     lines = [
         f":rotating_light: *Sentry storm: {len(triage) + len(listed)} new issue "
-        f"group(s) in one poll.* Auto-triaging the top {len(triage)}:",
+        f"group(s) in one poll.* Auto-triaging the top {len(triage)}, each in its own thread:",
         *(_line(g) for g in triage),
     ]
     if listed:

@@ -17,18 +17,26 @@ every restart and seed-on-start would permanently skip anything open at that
 moment. The ledger gives each issue a phase:
 
   * ``announced`` — a Slack thread was opened; the triage turn may or may not
-    have completed. On startup these are re-fired (a duplicate announce after
-    a crash is acceptable; a silently lost investigation is not).
+    have completed. Re-offered once on the first poll after startup (a
+    duplicate announce after a crash is acceptable; a silently lost
+    investigation is not) — never on later polls, so a persistently failing
+    dispatch cannot re-announce every interval.
+  * ``retry`` — dispatch failed before or during the turn; retried on later
+    polls until MAX_TRIAGE_ATTEMPTS is spent.
+  * ``failed`` — MAX_TRIAGE_ATTEMPTS dispatches failed. Logged loudly, never
+    auto-fired again; a human triages it by hand.
   * ``completed`` — the triage turn ran to the end, or the entry was seeded.
   * ``listed`` — surfaced in a storm rollup but not auto-triaged; a human
-    triages it by hand from the rollup checklist. Never auto-fired again.
+    triages it by hand from the rollup checklist. Never auto-fired again,
+    including on regression.
 
-First run (no ledger file) seeds: every currently-unresolved issue is recorded
-``completed`` and nothing fires, so enabling the feature doesn't dump the
-backlog into Slack. A resolved issue that comes back is re-fired once per
-regression episode: Sentry marks it ``substatus=regressed``, and the ledger
-remembers which substatus it last fired on, clearing that memory when the
-issue is next seen healthy.
+First run (no ledger file) seeds: every currently-unresolved issue — paged
+through in full, not just the first page — is recorded ``completed`` and
+nothing fires, so enabling the feature doesn't dump the backlog into Slack.
+A resolved issue that comes back is re-fired once per regression episode:
+Sentry marks it ``substatus=regressed``, and the ledger remembers which
+substatus it last fired on, clearing that memory when the issue is next seen
+healthy.
 
 Issues sharing a culprit within one poll are grouped into a single fire — one
 defect routinely produces two or more issues within minutes (an explicit
@@ -76,9 +84,14 @@ SEARCH_QUERY = "is:unresolved environment:prod level:error"
 
 # The poll interval floor exists to protect the shared org rate limit, not
 # responsiveness — at the default 15min a burst of new issues still reaches
-# Slack the same quarter-hour it reaches Sentry.
+# Slack the same quarter-hour it reaches Sentry (triage turns then run
+# serially, so a large burst finishes later than it starts).
 DEFAULT_INTERVAL_S = 900.0
 MIN_INTERVAL_S = 60.0
+
+# A Retry-After above this is a misbehaving server, not advice worth taking:
+# honoring an unbounded (or inf/nan) value would park the watch until restart.
+MAX_RETRY_AFTER_S = 3600.0
 
 FETCH_TIMEOUT_S = 60.0
 
@@ -88,7 +101,16 @@ FETCH_TIMEOUT_S = 60.0
 MAX_FIRES_PER_POLL = 5
 MAX_STORM_TRIAGE = 3
 
+# Dispatches per issue before giving up. The triage turn may have partially
+# run (the skill dedups against Jira before filing, so a retry is safe), but a
+# dispatch that keeps failing is an environment problem retries won't fix.
+MAX_TRIAGE_ATTEMPTS = 2
+
 PAGE_LIMIT = 100
+
+# Seeding pages through the whole unresolved queue so nothing later fires as
+# fake-new; this cap only bounds a pathological queue (>2000 issues).
+MAX_SEED_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -126,8 +148,14 @@ class IssueGroup:
 
 
 class TriageNotStarted(Exception):
-    """The callback failed before any Claude turn started. Safe to release the
-    ledger claim and retry on a later poll."""
+    """The callback failed before any announce or Claude turn. Safe to release
+    the ledger claim and retry on a later poll without burning an attempt."""
+
+
+class TriageTurnFailed(Exception):
+    """The announce posted but the Claude turn errored out. The thread shows a
+    warning, no investigation ran; retrying costs a duplicate announce, which
+    is cheaper than a silently buried issue."""
 
 
 TRIAGE_INSTRUCTION_TEMPLATE = """\
@@ -247,10 +275,15 @@ def group_by_culprit(issues: list[SentryIssue]) -> list[IssueGroup]:
     return groups
 
 
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 class Ledger:
     """Issue-id -> phase record, persisted with an atomic replace on every
-    mutation. Losing this file is safe (the next start re-seeds and fires
-    nothing); trusting a torn half-write is not."""
+    batch of mutations. Losing this file is safe (the next start re-seeds and
+    fires nothing); trusting a torn half-write is not, and a failed save must
+    degrade the dedup guarantee, never crash the wrapper."""
 
     def __init__(self, path: Optional[str] = None) -> None:
         self._path = path or state_path(LEDGER_FILE)
@@ -259,7 +292,7 @@ class Ledger:
         try:
             with open(self._path) as f:
                 data = json.load(f)
-            issues = data.get("issues")
+            issues = data.get("issues") if isinstance(data, dict) else None
             if isinstance(issues, dict):
                 self._issues = {
                     k: v for k, v in issues.items() if isinstance(v, dict)
@@ -277,9 +310,15 @@ class Ledger:
 
     def _save(self) -> None:
         tmp = f"{self._path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump({"issues": self._issues}, f, indent=1)
-        os.replace(tmp, self._path)
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"issues": self._issues}, f)
+            os.replace(tmp, self._path)
+        except OSError:
+            # In-memory state stays correct for this process; the cost of a
+            # lost save is a possible duplicate fire after restart, which the
+            # triage skill's Jira dedup absorbs.
+            log.warning("could not persist ledger %s", self._path, exc_info=True)
 
     def phase(self, issue_id: str) -> Optional[str]:
         entry = self._issues.get(issue_id)
@@ -289,13 +328,24 @@ class Ledger:
         entry = self._issues.get(issue_id)
         return entry.get("fired_substatus") if entry else None
 
-    def record(self, issue: SentryIssue, phase: str) -> None:
-        self._issues[issue.id] = {
-            "phase": phase,
-            "short_id": issue.short_id,
-            "fired_substatus": issue.substatus,
-            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
+    def attempts(self, issue_id: str) -> int:
+        entry = self._issues.get(issue_id)
+        try:
+            return int(entry.get("attempts", 0)) if entry else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def record_group(self, issues: tuple[SentryIssue, ...] | list[SentryIssue],
+                     phase: str, attempts: Optional[int] = None) -> None:
+        for issue in issues:
+            prev = self._issues.get(issue.id) or {}
+            self._issues[issue.id] = {
+                "phase": phase,
+                "short_id": issue.short_id,
+                "fired_substatus": issue.substatus,
+                "attempts": attempts if attempts is not None else prev.get("attempts", 0),
+                "recorded_at": _now_iso(),
+            }
         self._save()
 
     def clear_regression_memory(self, issue_id: str) -> None:
@@ -310,7 +360,8 @@ class Ledger:
                 "phase": "completed",
                 "short_id": issue.short_id,
                 "fired_substatus": issue.substatus,
-                "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "attempts": 0,
+                "recorded_at": _now_iso(),
             }
         self._save()
 
@@ -341,6 +392,11 @@ class SentryPoller:
             interval_s = MIN_INTERVAL_S
         self._interval_s = interval_s
         self._ledger = ledger if ledger is not None else Ledger()
+        # `announced` entries are a crashed run's possibly-lost investigations.
+        # They are re-offered exactly once, on the first successful poll after
+        # startup — re-offering on every poll would turn any persistent
+        # dispatch failure into an announce per interval for weeks.
+        self._reoffer_announced = True
         self._fetch_failures = 0
         self._retry_after_s = 0.0
         self._task: Optional[asyncio.Task] = None
@@ -384,11 +440,14 @@ class SentryPoller:
     def _select_new(self, issues: list[SentryIssue]) -> list[SentryIssue]:
         """The dedup contract, pure with respect to I/O.
 
-        New = never in the ledger, stuck at ``announced`` (a crashed run's lost
-        investigation), or regressed since it last fired. Also clears the
-        regression memory of issues seen healthy again, so the next regression
-        episode can fire.
+        New = never in the ledger, awaiting a retry, stuck at ``announced``
+        (startup re-offer only), or a ``completed`` issue that regressed since
+        it last fired. ``listed`` and ``failed`` never auto-fire — both are
+        explicit hand-offs to a human. Also clears the regression memory of
+        issues seen healthy again, so the next regression episode can fire.
         """
+        reoffer = ("announced",) if self._reoffer_announced else ()
+        self._reoffer_announced = False
         selected: list[SentryIssue] = []
         seen_ids: set[str] = set()
         for issue in issues:
@@ -396,10 +455,11 @@ class SentryPoller:
                 continue
             seen_ids.add(issue.id)
             phase = self._ledger.phase(issue.id)
-            if phase in (None, "announced", "retry"):
+            if phase is None or phase == "retry" or phase in reoffer:
                 selected.append(issue)
             elif (
-                issue.substatus == "regressed"
+                phase == "completed"
+                and issue.substatus == "regressed"
                 and self._ledger.fired_substatus(issue.id) != "regressed"
             ):
                 selected.append(issue)
@@ -409,11 +469,13 @@ class SentryPoller:
 
     async def _loop(self) -> None:
         async with aiohttp.ClientSession() as http:
-            # Seed until a fetch genuinely succeeds; nothing fires before the
-            # ledger holds a real picture of the unresolved queue.
+            # Seed until a full paged fetch genuinely succeeds; nothing fires
+            # before the ledger holds a complete picture of the unresolved
+            # queue — a one-page seed would let the unseeded remainder fire
+            # later as fake-new.
             while not self._ledger.existed:
                 try:
-                    issues = await self._fetch(http)
+                    issues = await self._fetch_all_pages(http)
                     if issues is None:
                         log.log(
                             logging.ERROR if self._fetch_failures <= 1 else logging.DEBUG,
@@ -462,26 +524,37 @@ class SentryPoller:
             "new Sentry issue: %s — %s (+%d sibling(s))",
             p.short_id, p.title, len(group.siblings),
         )
+        attempts = self._ledger.attempts(p.id) + 1
         # Claim before firing: a turn that fails half-way may already have
-        # posted to Slack or filed a ticket, and a duplicate of either is worse
-        # than a lost retry. The startup re-offer of `announced` entries covers
-        # the crash case.
-        for issue in group.issues:
-            self._ledger.record(issue, "announced")
+        # posted to Slack or filed a ticket. Retries are bounded and safe —
+        # the triage skill dedups against Jira before filing — and the startup
+        # re-offer of `announced` entries covers the crash case.
+        self._ledger.record_group(group.issues, "announced", attempts)
         try:
             await self._on_new(group)
         except TriageNotStarted:
-            # Explicitly guaranteed that no Claude turn began, so the claim can
-            # be released for a later poll to retry.
-            for issue in group.issues:
-                self._ledger.record(issue, "retry")
+            # No announce, no turn: release the claim and refund the attempt.
+            self._ledger.record_group(group.issues, "retry", attempts - 1)
             log.warning("triage dispatch did not start for %s; will retry", p.short_id)
             return
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 — one bad issue mustn't kill the loop
-            log.exception("on_new callback failed for %s", p.short_id)
+            # TriageTurnFailed and any unexpected dispatch error land here: the
+            # turn did not complete. Bounded retry, then a loud hand-off — an
+            # environment that keeps failing dispatches won't be fixed by more.
+            if attempts >= MAX_TRIAGE_ATTEMPTS:
+                self._ledger.record_group(group.issues, "failed", attempts)
+                log.error(
+                    "triage failed %d time(s) for %s; giving up — triage it by "
+                    "hand from %s", attempts, p.short_id, p.permalink,
+                    exc_info=True,
+                )
+            else:
+                self._ledger.record_group(group.issues, "retry", attempts)
+                log.exception("triage turn failed for %s; will retry", p.short_id)
             return
-        for issue in group.issues:
-            self._ledger.record(issue, "completed")
+        self._ledger.record_group(group.issues, "completed", attempts)
 
     async def _fire_storm(self, groups: list[IssueGroup]) -> None:
         triage = groups[:MAX_STORM_TRIAGE]
@@ -500,38 +573,80 @@ class SentryPoller:
             # issue unledgered so the next poll retries the whole storm.
             log.exception("rollup callback failed; storm will retry next poll")
             return
-        for group in listed:
-            for issue in group.issues:
-                self._ledger.record(issue, "listed")
+        listed_issues = [i for g in listed for i in g.issues]
+        self._ledger.record_group(listed_issues, "listed")
         for group in triage:
             await self._fire(group)
 
-    async def _fetch(self, http: aiohttp.ClientSession) -> Optional[list[SentryIssue]]:
-        """Unresolved prod issues, or None if the API call failed.
+    def _issues_url(self, cursor: Optional[str] = None) -> str:
+        params = {
+            "query": SEARCH_QUERY,
+            "sort": "date",
+            "limit": str(PAGE_LIMIT),
+            "statsPeriod": "90d",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return f"{API_BASE}/api/0/organizations/{self._org}/issues/?{urlencode(params)}"
 
-        None and [] are deliberately different, exactly as in the PR poller.
+    async def _fetch(self, http: aiohttp.ClientSession) -> Optional[list[SentryIssue]]:
+        """First page of unresolved prod issues, or None if the call failed.
+
+        One page suffices at steady state — the poll delta is a handful of
+        issues — and the full-page warning below flags it if that stops being
+        true. None and [] are deliberately different, exactly as in the PR
+        poller.
         """
-        params = urlencode(
-            {
-                "query": SEARCH_QUERY,
-                "sort": "date",
-                "limit": str(PAGE_LIMIT),
-                "statsPeriod": "90d",
-            }
+        page = await self._fetch_page(http)
+        if page is None:
+            return None
+        issues, has_more = page
+        if has_more:
+            log.warning(
+                "Sentry returned a full page (%d) of unresolved issues; issues "
+                "beyond the first page are not being watched this poll", PAGE_LIMIT,
+            )
+        self._fetch_failures = 0
+        return issues
+
+    async def _fetch_all_pages(
+        self, http: aiohttp.ClientSession
+    ) -> Optional[list[SentryIssue]]:
+        """Every unresolved prod issue, following pagination; None if any page
+        fails — a partial seed would make the missing remainder fire later as
+        fake-new, which is the exact failure seeding exists to prevent."""
+        issues: list[SentryIssue] = []
+        cursor: Optional[str] = None
+        for _ in range(MAX_SEED_PAGES):
+            page = await self._fetch_page(http, cursor)
+            if page is None:
+                return None
+            batch, has_more, cursor = page
+            issues.extend(batch)
+            if not has_more or not cursor:
+                self._fetch_failures = 0
+                return issues
+        log.warning(
+            "Sentry seed stopped after %d pages (%d issues); anything beyond "
+            "may later fire as new", MAX_SEED_PAGES, len(issues),
         )
-        url = f"{API_BASE}/api/0/organizations/{self._org}/issues/?{params}"
+        self._fetch_failures = 0
+        return issues
+
+    async def _fetch_page(
+        self, http: aiohttp.ClientSession, cursor: Optional[str] = None
+    ):
+        """One page: (issues, has_more, next_cursor), or None on failure."""
         try:
             async with http.get(
-                url,
+                self._issues_url(cursor),
                 headers={"Authorization": f"Bearer {self._token}"},
                 timeout=aiohttp.ClientTimeout(total=min(self._interval_s, FETCH_TIMEOUT_S)),
             ) as resp:
                 if resp.status == 429:
-                    retry_after = resp.headers.get("Retry-After", "")
-                    try:
-                        self._retry_after_s = float(retry_after)
-                    except ValueError:
-                        self._retry_after_s = self._interval_s
+                    self._retry_after_s = _parse_retry_after(
+                        resp.headers.get("Retry-After", ""), self._interval_s
+                    )
                     self._log_fetch_failure(
                         "Sentry rate-limited the issues fetch; retrying after %.0fs",
                         self._retry_after_s,
@@ -550,6 +665,9 @@ class SentryPoller:
                     )
                     return None
                 items = await resp.json()
+                next_link = resp.links.get("next") or {}
+                has_more = str(next_link.get("results")) == "true"
+                next_cursor = next_link.get("cursor")
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -561,16 +679,25 @@ class SentryPoller:
                 "Sentry issues payload was not a JSON array: %r", str(items)[:200]
             )
             return None
-        if len(items) >= PAGE_LIMIT:
-            # One page is plenty at real volume; if it ever isn't, say so
-            # rather than silently missing the overflow.
-            log.warning(
-                "Sentry returned a full page (%d) of unresolved issues; issues "
-                "beyond the first page are not being watched", PAGE_LIMIT,
-            )
-        self._fetch_failures = 0
-        return parse_issues(items)
+        return (
+            parse_issues(items),
+            has_more,
+            next_cursor if isinstance(next_cursor, str) else None,
+        )
 
     def _log_fetch_failure(self, msg: str, *args: object) -> None:
         self._fetch_failures += 1
         log.log(logging.WARNING if self._fetch_failures == 1 else logging.DEBUG, msg, *args)
+
+
+def _parse_retry_after(raw: str, fallback: float) -> float:
+    """Clamp a Retry-After header to something sane. An HTTP-date form, junk,
+    inf/nan, or an absurd delay all resolve to the fallback/cap — a server must
+    not be able to park the watch until restart."""
+    try:
+        v = float(raw)
+    except ValueError:
+        return fallback
+    if not math.isfinite(v) or v <= 0:
+        return fallback
+    return min(v, MAX_RETRY_AFTER_S)
