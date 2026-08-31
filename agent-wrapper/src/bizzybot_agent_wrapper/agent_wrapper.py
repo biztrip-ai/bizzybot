@@ -808,7 +808,7 @@ async def handle_sentry_issue(
     announce = (
         f":rotating_light: *New Sentry issue* — {link}{siblings} ({p.project_slug})\n"
         f"> *{_slack_escape(p.title)}*\n"
-        f"> {p.count} event(s), {p.user_count} user(s) — `{_slack_escape(p.culprit)}`"
+        f"> {p.count} event(s), {p.user_count} user(s) — {_slack_escape(p.culprit)}"
     )
     try:
         resp = await slack.chat_postMessage(channel=channel, text=announce)

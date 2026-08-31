@@ -25,9 +25,9 @@ moment. The ledger gives each issue a phase:
   * ``failed`` — MAX_TRIAGE_ATTEMPTS dispatches failed. Logged loudly, never
     auto-fired again; a human triages it by hand.
   * ``completed`` — the triage turn ran to the end, or the entry was seeded.
-    Re-fires once per regression episode: the ledger remembers which
-    ``substatus`` it last fired on, clearing that memory when the issue is
-    next seen healthy.
+    Pruned once the issue leaves the unresolved set, so a resolve-then-regress
+    cycle fires as new; an issue that regresses while still unresolved re-fires
+    via the ``fired_substatus`` memory, cleared when it is next seen healthy.
   * ``listed`` — surfaced in a storm rollup but not auto-triaged; a human
     triages it by hand from the rollup checklist. Never auto-fired again,
     including on regression.
@@ -323,6 +323,23 @@ class Ledger:
             }
         self._save()
 
+    def prune_absent(self, present_ids: set[str]) -> None:
+        """Drop ``completed``/``retry`` entries for issues no longer in the
+        unresolved set — a resolved issue that later regresses then fires as
+        new, which is the desired alert. ``failed``/``listed``/``announced``
+        entries persist: the first two are manual hand-offs that must never
+        auto-fire, the last is a crash claim awaiting its startup re-offer.
+        Call only with the COMPLETE unresolved set — pruning from a truncated
+        page would re-fire issues that merely fell off it."""
+        gone = [
+            k for k, v in self._issues.items()
+            if k not in present_ids and v.get("phase") in ("completed", "retry")
+        ]
+        if gone:
+            for k in gone:
+                del self._issues[k]
+            self._save()
+
     def clear_regression_memory(self, issue_id: str) -> None:
         entry = self._issues.get(issue_id)
         if entry and entry.get("fired_substatus") == "regressed":
@@ -472,9 +489,12 @@ class SentryPoller:
                 try:
                     await asyncio.sleep(max(self._interval_s, self._retry_after_s))
                     self._retry_after_s = 0.0
-                    issues = await self._fetch(http)
-                    if issues is None:
+                    fetched = await self._fetch(http)
+                    if fetched is None:
                         continue  # transient failure — never read as "no issues"
+                    issues, complete = fetched
+                    if complete:
+                        self._ledger.prune_absent({i.id for i in issues})
                     new = self._select_new(issues)
                     if not new:
                         continue
@@ -542,7 +562,11 @@ class SentryPoller:
             # issue unledgered so the next poll retries the whole storm.
             log.exception("rollup callback failed; storm will retry next poll")
             return
-        listed_issues = [i for g in listed for i in g.issues]
+        # An issue already claimed (retry/announced) keeps its phase — the
+        # rollup lists it, but its pending auto-retry still runs.
+        listed_issues = [
+            i for g in listed for i in g.issues if self._ledger.phase(i.id) is None
+        ]
         self._ledger.record_group(listed_issues, "listed")
         for group in triage:
             await self._fire(group)
@@ -577,7 +601,7 @@ class SentryPoller:
                 "beyond the first page are not being watched this poll", PAGE_LIMIT,
             )
         self._fetch_failures = 0
-        return issues
+        return issues, not has_more
 
     async def _fetch_all_pages(
         self, http: aiohttp.ClientSession
