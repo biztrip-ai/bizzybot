@@ -36,7 +36,7 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import email_reply, pr_poller
+from . import email_reply, pr_poller, sentry_poller
 from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
@@ -427,7 +427,11 @@ def normalize_slack_event(
 
 async def handle_user_message(
     payload: dict[str, Any], sessions: SessionManager, slack: AsyncWebClient
-) -> None:
+) -> bool:
+    """Returns False when the Claude turn raised (the thread shows a warning in
+    that case); True otherwise. Most callers ignore this — the Sentry triage
+    path uses it to retry rather than record a crashed turn as handled."""
+    turn_ok = True
     thread_key = payload.get("thread_key")
     channel = payload.get("channel")
     reply_ts = payload.get("reply_thread_ts")
@@ -435,7 +439,7 @@ async def handle_user_message(
     files = payload.get("files") or []
     if not thread_key or not channel or (not text and not files):
         log.warning("skipping message missing thread_key/channel/text")
-        return
+        return True
 
     if files:
         local = await download_slack_files(files, slack.token or "")
@@ -502,6 +506,7 @@ async def handle_user_message(
             else:
                 await renderer.replace_with("_nothing new to report_")
     except Exception as e:  # noqa: BLE001 — surface any turn failure to Slack
+        turn_ok = False
         log.exception("session error on %s", thread_key)
         await renderer.replace_with(f":warning: error: `{e}`")
 
@@ -515,6 +520,7 @@ async def handle_user_message(
     email_ctx = payload.get("_email")
     if email_ctx:
         await _send_email_reply(email_ctx, joined, channel, reply_ts, slack)
+    return turn_ok
 
 
 # --- Background-task flush --------------------------------------------------
@@ -784,6 +790,77 @@ async def handle_pr_review_request(
     await handle_user_message(synth, sessions, slack)
 
 
+async def handle_sentry_issue(
+    group: sentry_poller.IssueGroup,
+    channel: str,
+    sessions: SessionManager,
+    slack: AsyncWebClient,
+) -> None:
+    """A new production Sentry issue appeared: announce it in the configured
+    channel, then run a Claude turn in that thread which triages it via the
+    sentry-triage skill (investigation, and Jira filing when proven).
+    """
+    p = group.primary
+    link = f"<{p.permalink}|{p.short_id}>"
+    siblings = "".join(
+        f" + <{s.permalink}|{s.short_id}>" for s in group.siblings
+    )
+    announce = (
+        f":rotating_light: *New Sentry issue* — {link}{siblings} ({p.project_slug})\n"
+        f"> *{_slack_escape(p.title)}*\n"
+        f"> {p.count} event(s), {p.user_count} user(s) — {_slack_escape(p.culprit)}"
+    )
+    try:
+        resp = await slack.chat_postMessage(channel=channel, text=announce)
+    except Exception as exc:  # noqa: BLE001 — contained by the poll loop
+        log.exception(
+            "Sentry announce failed for %s in channel %s — is SENTRY_WATCH_CHANNEL a "
+            "channel id the bot has been invited to?", p.short_id, channel,
+        )
+        raise sentry_poller.TriageNotStarted from exc
+    thread_ts = resp["ts"]
+
+    synth = {
+        "thread_key": f"{channel}:{thread_ts}",
+        "channel": channel,
+        "reply_thread_ts": thread_ts,
+        "text": sentry_poller.build_triage_instruction(group),
+        "files": [],
+    }
+    if not await handle_user_message(synth, sessions, slack):
+        raise sentry_poller.TriageTurnFailed(group.primary.short_id)
+
+
+async def handle_sentry_rollup(
+    triage: list[sentry_poller.IssueGroup],
+    listed: list[sentry_poller.IssueGroup],
+    channel: str,
+    slack: AsyncWebClient,
+) -> None:
+    """A storm (many new issues in one poll): one summary message for the whole
+    batch. The poller then auto-triages `triage` in their own threads; `listed`
+    stays a manual checklist here."""
+    def _line(g: sentry_poller.IssueGroup) -> str:
+        p = g.primary
+        extra = f" (+{len(g.siblings)} sibling)" if g.siblings else ""
+        return (
+            f"• <{p.permalink}|{p.short_id}>{extra} — {_slack_escape(p.title)} "
+            f"({p.count} ev / {p.user_count} usr)"
+        )
+
+    lines = [
+        f":rotating_light: *Sentry storm: {len(triage) + len(listed)} new issue "
+        f"group(s) in one poll.* Auto-triaging the top {len(triage)}, each in its own thread:",
+        *(_line(g) for g in triage),
+    ]
+    if listed:
+        lines += [
+            f"Not auto-triaged ({len(listed)}) — ask me to `triage <id>` for any of these:",
+            *(_line(g) for g in listed),
+        ]
+    await slack.chat_postMessage(channel=channel, text="\n".join(lines))
+
+
 async def handle_clear(payload: dict, sessions: SessionManager, slack: AsyncWebClient) -> None:
     channel, reply_ts, thread_key = payload.get("channel"), payload.get("reply_thread_ts"), payload.get("thread_key")
     if not thread_key or not channel:
@@ -1029,6 +1106,32 @@ def pr_poller_config(settings: dict[str, str]) -> tuple[Optional[str], str, floa
     return channel, login, interval
 
 
+def sentry_poller_config(settings: dict[str, str]) -> tuple[Optional[str], str, str, float]:
+    """(channel, token, org, interval) for the Sentry watch poller. A None
+    channel means the feature is off — the same "unconfigured means no-op"
+    shape as the PR poller. A channel with no token is a configuration mistake,
+    so it warns rather than silently doing nothing forever."""
+    channel = resolve(settings, "SENTRY_WATCH_CHANNEL")
+    token = resolve(settings, "SENTRY_API_TOKEN") or ""
+    org = resolve(settings, "SENTRY_ORG") or "biztrip-ai"
+    raw = resolve(settings, "SENTRY_POLL_INTERVAL_S")
+    try:
+        interval = float(raw) if raw else sentry_poller.DEFAULT_INTERVAL_S
+    except ValueError:
+        log.warning(
+            "SENTRY_POLL_INTERVAL_S=%r is not a number; using %.0f",
+            raw, sentry_poller.DEFAULT_INTERVAL_S,
+        )
+        interval = sentry_poller.DEFAULT_INTERVAL_S
+    if channel and not token:
+        log.warning(
+            "SENTRY_WATCH_CHANNEL is set but SENTRY_API_TOKEN is not; "
+            "Sentry watch stays disabled"
+        )
+        channel = None
+    return channel, token, org, interval
+
+
 async def main() -> None:
     central_dispatch = resolve_central_dispatch()
     preflight()
@@ -1076,6 +1179,27 @@ async def main() -> None:
             )
         else:
             log.info("PR review poller disabled (set PR_REVIEW_CHANNEL to enable)")
+
+        # Sentry watch poller — same lifecycle as the PR poller above.
+        sw_channel, sw_token, sw_org, sw_interval = sentry_poller_config(settings)
+        sentry_watch: Optional[sentry_poller.SentryPoller] = None
+        if sw_channel:
+            async def on_sentry_issue(group: sentry_poller.IssueGroup) -> None:
+                await handle_sentry_issue(group, sw_channel, sessions, slack)
+
+            async def on_sentry_rollup(
+                triage: list[sentry_poller.IssueGroup],
+                listed: list[sentry_poller.IssueGroup],
+            ) -> None:
+                await handle_sentry_rollup(triage, listed, sw_channel, slack)
+
+            sentry_watch = sentry_poller.SentryPoller(
+                token=sw_token, org=sw_org,
+                on_new=on_sentry_issue, on_rollup=on_sentry_rollup,
+                interval_s=sw_interval,
+            )
+        else:
+            log.info("Sentry watch disabled (set SENTRY_WATCH_CHANNEL to enable)")
 
         # Wake threads when a background sub-agent finishes (see the
         # "Background-task flush" section above). thread_key -> the task holding
@@ -1137,6 +1261,8 @@ async def main() -> None:
         try:
             if poller is not None:
                 poller.start()
+            if sentry_watch is not None:
+                sentry_watch.start()
             await consume(http, ws_url, ws_token, on_event, stop)
         finally:
             log.info("shutting down")
@@ -1145,6 +1271,8 @@ async def main() -> None:
             # killed, which surfaces as a spurious error in Slack on every exit.
             if poller is not None:
                 await poller.stop()
+            if sentry_watch is not None:
+                await sentry_watch.stop()
             await sessions.close_all()
 
 
