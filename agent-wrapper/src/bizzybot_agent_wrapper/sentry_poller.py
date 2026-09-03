@@ -42,7 +42,6 @@ import math
 import os
 import re
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlencode
@@ -707,9 +706,6 @@ def _parse_retry_after(raw: str, fallback: float) -> float:
 # staleness window, and an alert rule can skip issues entirely. Both share one
 # Ledger, so neither mechanism re-triages the other's work.
 
-ALERT_RATE_WINDOW_S = 900.0
-ALERT_RATE_MAX_FIRES = 3
-
 _PERMALINK_ID_RE = re.compile(r"sentry\.io/(?:organizations/[^/\"]+/)?issues/(\d+)")
 _SHORT_ID_RE = re.compile(r"Short ID[:*\s]+([A-Z][A-Z0-9_]*(?:-[A-Z0-9]+)+)")
 
@@ -779,16 +775,11 @@ class SentryAlertHook:
         app_id: Optional[str],
         ledger: Ledger,
         on_fire: Callable[[AlertRef, str], Awaitable[bool]],
-        on_defer: Callable[[AlertRef, str], Awaitable[None]],
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._channel = channel
         self._app_id = app_id
         self._ledger = ledger
         self._on_fire = on_fire  # (ref, message ts) -> turn completed cleanly?
-        self._on_defer = on_defer  # rate-capped: tell the thread, don't triage
-        self._clock = clock
-        self._fires: deque[float] = deque()
         # Slack redelivers events (webhook retries, unacked-crash replay); the
         # ledger claim is the durable guard, this set just avoids double work
         # within one process lifetime.
@@ -825,18 +816,6 @@ class SentryAlertHook:
             return
         # phase "completed" with a fresh alert message = Sentry re-alerting
         # (a regression); fire again.
-        now = self._clock()
-        while self._fires and now - self._fires[0] > ALERT_RATE_WINDOW_S:
-            self._fires.popleft()
-        if len(self._fires) >= ALERT_RATE_MAX_FIRES:
-            log.warning(
-                "alert rate cap reached; deferring %s to the sweeper", ref.handle
-            )
-            # Left out of the ledger on purpose: the poller sweeps it up later,
-            # or a human says "triage <id>" in the thread.
-            await self._on_defer(ref, ts)
-            return
-        self._fires.append(now)
         issue = _ref_issue(ref)
         attempts = self._ledger.attempts(ref.key) + 1
         self._ledger.record_group([issue], "announced", attempts)

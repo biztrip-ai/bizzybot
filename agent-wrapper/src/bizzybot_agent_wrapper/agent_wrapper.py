@@ -1237,17 +1237,9 @@ async def main() -> None:
                 }
                 return await handle_user_message(synth, sessions, slack)
 
-            async def on_alert_defer(ref: sentry_poller.AlertRef, ts: str) -> None:
-                await slack.chat_postMessage(
-                    channel=sa_channel, thread_ts=ts,
-                    text=(":hourglass: Triage rate cap reached — this issue is "
-                          "queued for the hourly sweep. Ask me to "
-                          f"`triage {ref.handle}` to jump the queue."),
-                )
-
             SENTRY_ALERT_HOOK = sentry_poller.SentryAlertHook(
                 channel=sa_channel, app_id=sa_app_id, ledger=sentry_ledger,
-                on_fire=on_alert_fire, on_defer=on_alert_defer,
+                on_fire=on_alert_fire,
             )
             log.info("Sentry alert hook armed on channel %s", sa_channel)
         else:
