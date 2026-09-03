@@ -899,8 +899,16 @@ META_COMMANDS: dict[str, tuple[Callable[..., Awaitable[None]], str]] = {
 }
 
 
+# Set in main() when SENTRY_ALERT_CHANNEL is configured; consulted before the
+# normal message pipeline, which by design drops all bot-app messages.
+SENTRY_ALERT_HOOK: Optional[sentry_poller.SentryAlertHook] = None
+
+
 async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWebClient) -> None:
     """Handle one Slack event delivered by Central-Dispatch."""
+    if SENTRY_ALERT_HOOK is not None and SENTRY_ALERT_HOOK.matches(payload):
+        await SENTRY_ALERT_HOOK.handle(payload)
+        return
     bot_user_id = await get_bot_user_id(slack)
     msg = normalize_slack_event(payload, bot_user_id)
     if msg is None:
@@ -1132,6 +1140,16 @@ def sentry_poller_config(settings: dict[str, str]) -> tuple[Optional[str], str, 
     return channel, token, org, interval
 
 
+def sentry_alert_config(settings: dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+    """(channel, app_id) for the Sentry Slack-alert hook. A None channel means
+    the feature is off. app_id optionally pins the hook to the Sentry app's
+    messages; unset accepts any bot message in the channel."""
+    return (
+        resolve(settings, "SENTRY_ALERT_CHANNEL"),
+        resolve(settings, "SENTRY_ALERT_APP_ID"),
+    )
+
+
 async def main() -> None:
     central_dispatch = resolve_central_dispatch()
     preflight()
@@ -1180,7 +1198,10 @@ async def main() -> None:
         else:
             log.info("PR review poller disabled (set PR_REVIEW_CHANNEL to enable)")
 
-        # Sentry watch poller — same lifecycle as the PR poller above.
+        # Sentry watch poller — same lifecycle as the PR poller above. The
+        # alert hook and the poller share one ledger so neither re-triages
+        # the other's work.
+        sentry_ledger = sentry_poller.Ledger()
         sw_channel, sw_token, sw_org, sw_interval = sentry_poller_config(settings)
         sentry_watch: Optional[sentry_poller.SentryPoller] = None
         if sw_channel:
@@ -1196,10 +1217,41 @@ async def main() -> None:
             sentry_watch = sentry_poller.SentryPoller(
                 token=sw_token, org=sw_org,
                 on_new=on_sentry_issue, on_rollup=on_sentry_rollup,
-                interval_s=sw_interval,
+                interval_s=sw_interval, ledger=sentry_ledger,
             )
         else:
             log.info("Sentry watch disabled (set SENTRY_WATCH_CHANNEL to enable)")
+
+        # Sentry Slack-alert hook: triages in the Sentry app message's own
+        # thread the moment the alert lands.
+        global SENTRY_ALERT_HOOK
+        sa_channel, sa_app_id = sentry_alert_config(settings)
+        if sa_channel:
+            async def on_alert_fire(ref: sentry_poller.AlertRef, ts: str) -> bool:
+                synth = {
+                    "thread_key": f"{sa_channel}:{ts}",
+                    "channel": sa_channel,
+                    "reply_thread_ts": ts,
+                    "text": sentry_poller.build_alert_triage_instruction(ref),
+                    "files": [],
+                }
+                return await handle_user_message(synth, sessions, slack)
+
+            async def on_alert_defer(ref: sentry_poller.AlertRef, ts: str) -> None:
+                await slack.chat_postMessage(
+                    channel=sa_channel, thread_ts=ts,
+                    text=(":hourglass: Triage rate cap reached — this issue is "
+                          "queued for the hourly sweep. Ask me to "
+                          f"`triage {ref.handle}` to jump the queue."),
+                )
+
+            SENTRY_ALERT_HOOK = sentry_poller.SentryAlertHook(
+                channel=sa_channel, app_id=sa_app_id, ledger=sentry_ledger,
+                on_fire=on_alert_fire, on_defer=on_alert_defer,
+            )
+            log.info("Sentry alert hook armed on channel %s", sa_channel)
+        else:
+            log.info("Sentry alert hook disabled (set SENTRY_ALERT_CHANNEL to enable)")
 
         # Wake threads when a background sub-agent finishes (see the
         # "Background-task flush" section above). thread_key -> the task holding
