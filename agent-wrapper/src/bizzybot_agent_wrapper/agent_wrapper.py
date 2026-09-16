@@ -36,7 +36,7 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import email_reply, pr_poller, sentry_poller
+from . import email_reply, pr_poller, sentry_poller, support_hook
 from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
@@ -902,14 +902,18 @@ META_COMMANDS: dict[str, tuple[Callable[..., Awaitable[None]], str]] = {
 # Set in main() when SENTRY_ALERT_CHANNEL is configured; consulted before the
 # normal message pipeline, which by design drops all bot-app messages.
 SENTRY_ALERT_HOOK: Optional[sentry_poller.SentryAlertHook] = None
+SUPPORT_INBOX_HOOK: Optional[support_hook.SupportInboxHook] = None
 
 
 async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWebClient) -> None:
     """Handle one Slack event delivered by Central-Dispatch."""
+    bot_user_id = await get_bot_user_id(slack)
     if SENTRY_ALERT_HOOK is not None and SENTRY_ALERT_HOOK.matches(payload):
         await SENTRY_ALERT_HOOK.handle(payload)
         return
-    bot_user_id = await get_bot_user_id(slack)
+    if SUPPORT_INBOX_HOOK is not None and SUPPORT_INBOX_HOOK.matches(payload, bot_user_id):
+        await SUPPORT_INBOX_HOOK.handle(payload)
+        return
     msg = normalize_slack_event(payload, bot_user_id)
     if msg is None:
         return  # not addressed to us / an echo — ignore (still acked)
@@ -1150,6 +1154,16 @@ def sentry_alert_config(settings: dict[str, str]) -> tuple[Optional[str], Option
     )
 
 
+def support_inbox_config(settings: dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+    """(channel, app_id) for the customer-support inbox hook. A None channel
+    means the feature is off. app_id optionally pins the hook to one app's
+    posts; unset accepts every top-level message in the channel."""
+    return (
+        resolve(settings, "SUPPORT_CHANNEL"),
+        resolve(settings, "SUPPORT_APP_ID"),
+    )
+
+
 async def main() -> None:
     central_dispatch = resolve_central_dispatch()
     preflight()
@@ -1244,6 +1258,28 @@ async def main() -> None:
             log.info("Sentry alert hook armed on channel %s", sa_channel)
         else:
             log.info("Sentry alert hook disabled (set SENTRY_ALERT_CHANNEL to enable)")
+
+        # Customer-support inbox hook: triages every top-level post in the
+        # support channel in that post's own thread.
+        global SUPPORT_INBOX_HOOK
+        si_channel, si_app_id = support_inbox_config(settings)
+        if si_channel:
+            async def on_support_fire(text: str, files: list[dict[str, Any]], ts: str) -> None:
+                synth = {
+                    "thread_key": f"{si_channel}:{ts}",
+                    "channel": si_channel,
+                    "reply_thread_ts": ts,
+                    "text": text,
+                    "files": files,
+                }
+                await handle_user_message(synth, sessions, slack)
+
+            SUPPORT_INBOX_HOOK = support_hook.SupportInboxHook(
+                channel=si_channel, app_id=si_app_id, on_fire=on_support_fire,
+            )
+            log.info("support inbox hook armed on %s", si_channel)
+        else:
+            log.info("support inbox hook disabled (set SUPPORT_CHANNEL to enable)")
 
         # Wake threads when a background sub-agent finishes (see the
         # "Background-task flush" section above). thread_key -> the task holding
