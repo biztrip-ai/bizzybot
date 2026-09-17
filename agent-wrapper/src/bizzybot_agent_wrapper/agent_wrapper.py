@@ -366,6 +366,40 @@ async def get_bot_user_id(slack: AsyncWebClient) -> Optional[str]:
     return _bot_user_id
 
 
+# Message subtypes a person produces by typing or uploading. In a channel the
+# bot created it hears every message, so everything else (joins, leaves, topic
+# and rename notices, pins…) must not start a turn.
+_USER_SUBTYPES = {None, "file_share", "thread_broadcast", "me_message"}
+
+# channel id -> whether the bot created it. Cached both ways: a channel's
+# creator never changes.
+_owned_channels: dict[str, bool] = {}
+
+
+async def bot_owns_channel(
+    slack: AsyncWebClient, channel: str, bot_user_id: Optional[str]
+) -> bool:
+    """True iff the bot created this channel (conversations.info `creator`).
+    The bot listens to every message in channels it created, not just
+    @-mentions. A failed lookup (e.g. the workspace hasn't granted
+    channels:read yet) answers False without caching, so it's retried."""
+    if not bot_user_id:
+        return False
+    owned = _owned_channels.get(channel)
+    if owned is not None:
+        return owned
+    try:
+        resp = await slack.conversations_info(channel=channel)
+    except Exception as e:  # noqa: BLE001 — never let a lookup failure kill the turn
+        log.warning("conversations.info failed for %s: %s", channel, e)
+        return False
+    owned = (resp.get("channel") or {}).get("creator") == bot_user_id
+    _owned_channels[channel] = owned
+    if owned:
+        log.info("channel %s was created by the bot; listening to all messages", channel)
+    return owned
+
+
 # Threads we've confirmed the bot posted in, so repeat lookups are free. Only
 # "yes" results are cached (a "no" may become "yes" once the bot is @-mentioned).
 _bot_thread_cache: set[str] = set()
@@ -407,7 +441,10 @@ def normalize_slack_event(
       - replies typed into a channel/group thread the bot is already engaged in
         (no re-@mention needed). Those come as plain `message` events; we tag
         them `needs_active_session` so the caller only wakes on threads with a
-        live session.
+        live session (or in a channel the bot created),
+      - top-level channel/group posts without an @-mention, tagged
+        `needs_owned_channel`: the caller only acts on them in a channel the
+        bot created.
     """
     if not isinstance(event, dict) or event.get("bot_id"):
         return None
@@ -417,20 +454,24 @@ def normalize_slack_event(
     etype = event.get("type")
     channel_type = event.get("channel_type")
     needs_active_session = False
+    needs_owned_channel = False
     if etype == "app_mention":
         pass
     elif etype == "message" and channel_type == "im":
         pass
-    elif (
-        etype == "message"
-        and channel_type in ("channel", "group", "mpim")
-        and event.get("thread_ts")
-    ):
-        # A reply inside a channel/private thread. If it re-@mentions the bot,
-        # the app_mention event covers it — skip here to avoid double-handling.
+    elif etype == "message" and channel_type in ("channel", "group", "mpim"):
+        # A plain message in a channel. If it @-mentions the bot, the
+        # app_mention event covers it — skip here to avoid double-handling.
         if bot_user_id and f"<@{bot_user_id}>" in (event.get("text") or ""):
             return None
-        needs_active_session = True
+        if event.get("subtype") not in _USER_SUBTYPES:
+            return None
+        if event.get("thread_ts"):
+            needs_active_session = True
+        elif channel_type in ("channel", "group"):
+            needs_owned_channel = True
+        else:
+            return None
     else:
         return None
 
@@ -451,6 +492,7 @@ def normalize_slack_event(
         "files": event.get("files") or [],
         "user": event.get("user"),
         "needs_active_session": needs_active_session,
+        "needs_owned_channel": needs_owned_channel,
     }
 
 
@@ -949,16 +991,23 @@ async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWeb
     msg = normalize_slack_event(payload, bot_user_id)
     if msg is None:
         return  # not addressed to us / an echo — ignore (still acked)
+    # A top-level post without an @-mention only reaches the bot in a channel
+    # it created — there it hears everything.
+    if msg.pop("needs_owned_channel", False):
+        if not await bot_owns_channel(slack, msg["channel"], bot_user_id):
+            return
     # A bare channel-thread reply only wakes the bot if it's already engaged in
     # that thread — otherwise any reply in any channel the bot sits in would
     # trigger it. "Engaged" is, cheapest first: a live in-memory session, a
-    # persisted resume id (survives a restart), or — last resort — the bot
-    # actually appearing in the thread per conversations.replies.
+    # persisted resume id (survives a restart), a channel the bot created, or
+    # — last resort — the bot actually appearing in the thread per
+    # conversations.replies.
     if msg.pop("needs_active_session", False):
         thread_key = msg["thread_key"]
         engaged = (
             sessions.exists(thread_key)
             or sessions.has_resume(thread_key)
+            or await bot_owns_channel(slack, msg["channel"], bot_user_id)
             or await bot_participates_in_thread(
                 slack, msg["channel"], msg["reply_thread_ts"], bot_user_id
             )
