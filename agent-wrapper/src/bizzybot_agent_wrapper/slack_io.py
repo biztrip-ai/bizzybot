@@ -340,4 +340,6 @@ def tool_label(name: Optional[str], args: Optional[dict]) -> str:
         return "👥 listing Slack users"
     if name == "mcp__bizzybot__create_channel":
         return f"➕ creating #{_clip(str(a.get('name', '')))}"
+    if name == "mcp__bizzybot__archive_channel":
+        return f"🗄️ archiving {_clip(str(a.get('channel', '')))}"
     return f"🔧 {name}"
