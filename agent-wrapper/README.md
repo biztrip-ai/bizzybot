@@ -117,6 +117,10 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   (default `14400` = 4h; `0` disables), scanning every `SESSION_REAP_INTERVAL_S`
   (default `300`). The thread's resume id is kept, so the next message in a
   reaped thread transparently resumes the same conversation.
+- **Sender identity:** each Slack message reaches the agent with a first line
+  naming who wrote it, e.g. `[Slack message from Jane Doe (@jane), user ID
+  U0123 — mention as <@U0123>]`, so it can mention or invite that person
+  without asking. Names come from `users.info` and are cached for an hour.
 - **Slack workspace tools:** the agent gets an in-process MCP server,
   `bizzybot`, backed by the workspace's bot token: `list_channels`,
   `list_users` and `create_channel` (with optional topic, purpose and
