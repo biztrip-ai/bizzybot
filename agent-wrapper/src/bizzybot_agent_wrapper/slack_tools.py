@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Awaitable, Callable
+import re
+from typing import Any, Awaitable, Callable, Optional
 
 from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server, tool
 from mcp.types import ToolAnnotations
@@ -32,8 +33,22 @@ PAGE_SIZE = 200
 
 TOOLS_PROMPT = """\
 You have `mcp__bizzybot__*` tools for the Slack workspace you're talking in
-(list_channels, list_users, create_channel). Use them for anything about this
-workspace. Other Slack tools you may have can point at a different workspace."""
+(list_channels, list_users, create_channel, archive_channel). Use them for
+anything about this workspace. Other Slack tools you may have can point at a
+different workspace. Only archive a channel when the person asked for that
+specific channel to be archived."""
+
+# Slack error codes from conversations.archive, explained so the agent can tell
+# the person what to do instead of retrying.
+_ARCHIVE_ERRORS = {
+    "not_in_channel": "the bot isn't a member of that channel. Someone needs to "
+    "add it first (/invite the bot in the channel), then try again.",
+    "cant_archive_general": "the workspace's default channel can't be archived.",
+    "cant_archive_required": "that channel is required by the workspace and can't be archived.",
+    "restricted_action": "workspace settings don't let this bot archive channels.",
+    "channel_not_found": "no such channel, or the bot can't see it (private channels "
+    "are only visible once the bot is a member).",
+}
 
 
 def _ok(data: Any) -> dict[str, Any]:
@@ -130,6 +145,30 @@ def _user_row(u: dict[str, Any]) -> dict[str, Any]:
         "is_admin": bool(u.get("is_admin")),
         "tz": u.get("tz") or "",
     }
+
+
+async def _resolve_channel(slack: AsyncWebClient, ref: str) -> Optional[dict[str, Any]]:
+    """Look up a channel by id, or by name (with or without '#'). Names are
+    matched exactly against every channel the bot can see, archived included."""
+    ref = ref.strip()
+    if re.fullmatch(r"[CG][A-Z0-9]{6,}", ref):
+        try:
+            return (await slack.conversations_info(channel=ref))["channel"]
+        except SlackApiError as e:
+            data = e.response.data if isinstance(e.response.data, dict) else {}
+            if data.get("error") == "channel_not_found":
+                return None
+            raise
+    name = ref.lstrip("#").lower()
+    async for c in _paginate(
+        slack.conversations_list,
+        "channels",
+        types="public_channel,private_channel",
+        exclude_archived=False,
+    ):
+        if (c.get("name") or "").lower() == name:
+            return c
+    return None
 
 
 def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
@@ -298,6 +337,52 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
             out["warnings"] = warnings
         return _ok(out)
 
+    @tool(
+        "archive_channel",
+        "Archive a channel in this Slack workspace. Archived channels keep their "
+        "history and a workspace member can unarchive them from Slack. Slack "
+        "doesn't let bots delete channels outright. The bot must be a member of "
+        "the channel. Only use this when the person asked for this channel to "
+        "be archived.",
+        {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel id (C… or G…) or name, with or without the leading #.",
+                },
+            },
+            "required": ["channel"],
+        },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+    )
+    @_guard("conversations.archive")
+    async def archive_channel(args: dict[str, Any]) -> dict[str, Any]:
+        ref = (args.get("channel") or "").strip()
+        if not ref:
+            return _err("archive_channel needs a channel id or name")
+        channel = await _resolve_channel(slack, ref)
+        if channel is None:
+            return _err(f"Can't archive {ref}: {_ARCHIVE_ERRORS['channel_not_found']}")
+        row = _channel_row(channel)
+        if row["is_archived"]:
+            return _ok({"channel": row, "note": "already archived"})
+        try:
+            await slack.conversations_archive(channel=row["id"])
+        except SlackApiError as e:
+            data = e.response.data if isinstance(e.response.data, dict) else {}
+            code = data.get("error", "unknown_error")
+            if code == "already_archived":
+                row["is_archived"] = True
+                return _ok({"channel": row, "note": "already archived"})
+            if code in _ARCHIVE_ERRORS:
+                return _err(f"Can't archive #{row['name']}: {_ARCHIVE_ERRORS[code]}")
+            raise
+        log.info("archived channel %s (#%s)", row["id"], row["name"])
+        row["is_archived"] = True
+        return _ok({"channel": row})
+
     return create_sdk_mcp_server(
-        name=SERVER_NAME, tools=[list_channels, list_users, create_channel]
+        name=SERVER_NAME,
+        tools=[list_channels, list_users, create_channel, archive_channel],
     )

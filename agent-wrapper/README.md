@@ -123,8 +123,9 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   without asking. Names come from `users.info` and are cached for an hour.
 - **Slack workspace tools:** the agent gets an in-process MCP server,
   `bizzybot`, backed by the workspace's bot token: `list_channels`,
-  `list_users` and `create_channel` (with optional topic, purpose and
-  invites). Set `CLAUDE_SLACK_MCP=0` to turn it off. It needs the
+  `list_users`, `create_channel` (with optional topic, purpose and
+  invites) and `archive_channel` (Slack doesn't let bots delete channels, and
+  the bot must be a member of the channel it archives). Set `CLAUDE_SLACK_MCP=0` to turn it off. It needs the
   `channels:read`, `groups:read`, `channels:manage` and `groups:write` bot
   scopes; a workspace installed before those were added gets a `missing_scope`
   tool error until an admin clicks **Reinstall** on the app's dashboard card
