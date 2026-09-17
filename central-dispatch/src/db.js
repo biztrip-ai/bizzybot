@@ -102,6 +102,9 @@ export async function init() {
     await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS email_local_part TEXT`);
     await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS email_channel TEXT`);
     await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS email_sender_allow TEXT`);
+    // The human responsible for this agent: set from the Slack user who
+    // installed it, and the only user allowed to run shell commands through it.
+    await pool.query(`ALTER TABLE ${AGENTS} ADD COLUMN IF NOT EXISTS sponsor_slack_user_id TEXT`);
     // A local-part must be unique within a workspace (same local-part on two
     // different workspace domains is fine). Partial: only enforced when set.
     await pool.query(
@@ -181,6 +184,9 @@ export async function init() {
     }
     if (!cols.includes('email_sender_allow')) {
       sqlite.exec(`ALTER TABLE agents ADD COLUMN email_sender_allow TEXT`);
+    }
+    if (!cols.includes('sponsor_slack_user_id')) {
+      sqlite.exec(`ALTER TABLE agents ADD COLUMN sponsor_slack_user_id TEXT`);
     }
     sqlite.exec(
       `CREATE UNIQUE INDEX IF NOT EXISTS agents_team_email_local_part

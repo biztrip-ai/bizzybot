@@ -24,6 +24,19 @@ npm start              # or: npm run dev  (node --watch)
 | POST   | `/api/register`       | Agent-Wrapper dials home with its registration token.                 |
 | WS     | `/ws?token=<regtok>&lastSeq=<n>` | Agent event stream (replay + live push).            |
 
+## Sponsors
+
+Each agent has a **sponsor**: the human responsible for it. The Slack user who
+first installs the app becomes its sponsor, and it stays with them — a later
+reinstall by someone else doesn't take it over. On the dashboard each agent
+card shows its sponsor, and any workspace member can press *make me the
+sponsor* to take it on.
+
+`POST /api/register` returns `sponsorSlackUserId`, so the agent-wrapper names
+the sponsor in the agent's system prompt and (once `!!` lands) runs shell
+commands only for them. Agents installed before sponsors existed have none
+until someone claims it on the dashboard or reinstalls.
+
 ## Slack setup
 
 1. `GET /slack/manifest` → create a Slack app from the manifest.

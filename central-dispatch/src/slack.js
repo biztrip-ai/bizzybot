@@ -149,6 +149,32 @@ export async function botUserId(token) {
   return id;
 }
 
+// A user's display name, cached per (token, user). Used by the dashboard to
+// show an agent's sponsor as a name rather than a raw Slack id.
+const _userNameCache = new Map();
+export async function userName(token, userId) {
+  if (!token || !userId) return null;
+  const key = `${token}:${userId}`;
+  if (_userNameCache.has(key)) return _userNameCache.get(key);
+  let name = null;
+  try {
+    const res = await fetch(
+      `https://slack.com/api/users.info?user=${encodeURIComponent(userId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    const data = await res.json();
+    if (data.ok) {
+      const u = data.user || {};
+      const p = u.profile || {};
+      name = p.real_name || u.real_name || u.name || null;
+    }
+  } catch (e) {
+    console.warn('[slack] users.info failed:', e.message);
+  }
+  if (name) _userNameCache.set(key, name);
+  return name;
+}
+
 // True iff the bot has posted at least one message in this thread. Lets us skip
 // unrelated threads when deciding whether an offline notice is warranted.
 export async function botInThread({ token, channel, threadTs }) {

@@ -38,7 +38,7 @@ export async function getAgentById(id) {
 export async function listAgentsByTeam(teamId) {
   return all(
     `SELECT id, name, slack_app_id, registration_token, last_seen_at,
-            email_local_part, email_channel, email_sender_allow
+            email_local_part, email_channel, email_sender_allow, sponsor_slack_user_id
        FROM ${AGENTS} WHERE slack_team_id = ? ORDER BY created_at`,
     [teamId],
   );
@@ -138,6 +138,26 @@ export async function setAgentSlack(id, { teamId, appId, botToken } = {}) {
     `UPDATE ${AGENTS} SET slack_team_id = ?, slack_app_id = ?, slack_bot_token = ? WHERE id = ?`,
     [teamId ?? null, appId ?? null, botToken ?? null, id],
   );
+}
+
+// The agent's sponsor: the human responsible for it (and the only one who may
+// run shell commands through it). Claimed by the first install and sticky from
+// then on — a later reinstall by someone else doesn't take it over. Use
+// setAgentSponsor to hand it to someone else deliberately.
+export async function claimAgentSponsor(id, slackUserId) {
+  if (!slackUserId) return;
+  await run(
+    `UPDATE ${AGENTS} SET sponsor_slack_user_id = ?
+      WHERE id = ? AND (sponsor_slack_user_id IS NULL OR sponsor_slack_user_id = '')`,
+    [slackUserId, id],
+  );
+}
+
+export async function setAgentSponsor(id, slackUserId) {
+  await run(`UPDATE ${AGENTS} SET sponsor_slack_user_id = ? WHERE id = ?`, [
+    orNull(slackUserId),
+    id,
+  ]);
 }
 
 export async function markRegistered(id, { teamId, botToken } = {}) {
