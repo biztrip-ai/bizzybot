@@ -179,7 +179,9 @@ router.get('/dashboard', async (req, res) => {
         </div>
       </form>`;
 
-  const agentCard = (app, agent, i) => {
+  // `reinstallable` is false for orphans: their app is no longer configured, and
+  // /slack/install would fall back to the primary app.
+  const agentCard = (app, agent, i, reinstallable = true) => {
     const label = escapeHtml(agent?.name || app.name || 'Agent');
     if (!agent) {
       return `<div style="${cardStyle}">
@@ -194,7 +196,11 @@ router.get('/dashboard', async (req, res) => {
     const tokId = `regtok-${i}`;
     return `<div style="${cardStyle}">
       <h3 style="margin:0 0 8px">${label}</h3>
-      <p style="margin:0 0 12px">Slack: <b>✅ installed</b> · Agent: <b>${status}</b></p>
+      <p style="margin:0 0 12px">Slack: <b>✅ installed</b> · Agent: <b>${status}</b>${
+        reinstallable
+          ? ` · <a href="${installUrl(app)}" title="Re-run the Slack install to grant newly added permissions. Keeps this agent and its token; restart the agent-wrapper afterwards.">Reinstall</a>`
+          : ''
+      }</p>
       <p style="margin:0 0 6px">Registration token — paste it on first run of this agent:</p>
       <div style="display:flex;gap:8px;align-items:center;max-width:520px">
         <input id="${tokId}" value="${escapeHtml(agent.registration_token)}" readonly
@@ -213,7 +219,7 @@ router.get('/dashboard', async (req, res) => {
   const matched = new Set(apps.map(agentForApp).filter(Boolean).map((a) => a.id));
   const orphans = agents.filter((a) => !matched.has(a.id));
   const orphanCards = orphans
-    .map((a, i) => agentCard({ name: a.name, appId: a.slack_app_id }, a, apps.length + i))
+    .map((a, i) => agentCard({ name: a.name, appId: a.slack_app_id }, a, apps.length + i, false))
     .join('');
 
   const errBanner =

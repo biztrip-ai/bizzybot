@@ -301,4 +301,10 @@ def tool_label(name: Optional[str], args: Optional[dict]) -> str:
         return f"🤖 {_clip(str(a.get('description') or 'subagent'))}"
     if name == "WebSearch":
         return f"🔎 searching {_clip(str(a.get('query', '')))}"
+    if name == "mcp__bizzybot__list_channels":
+        return "💬 listing Slack channels"
+    if name == "mcp__bizzybot__list_users":
+        return "👥 listing Slack users"
+    if name == "mcp__bizzybot__create_channel":
+        return f"➕ creating #{_clip(str(a.get('name', '')))}"
     return f"🔧 {name}"

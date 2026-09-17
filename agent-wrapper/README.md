@@ -117,6 +117,14 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   (default `14400` = 4h; `0` disables), scanning every `SESSION_REAP_INTERVAL_S`
   (default `300`). The thread's resume id is kept, so the next message in a
   reaped thread transparently resumes the same conversation.
+- **Slack workspace tools:** the agent gets an in-process MCP server,
+  `bizzybot`, backed by the workspace's bot token: `list_channels`,
+  `list_users` and `create_channel` (with optional topic, purpose and
+  invites). Set `CLAUDE_SLACK_MCP=0` to turn it off. It needs the
+  `channels:read`, `groups:read`, `channels:manage` and `groups:write` bot
+  scopes; a workspace installed before those were added gets a `missing_scope`
+  tool error until an admin clicks **Reinstall** on the app's dashboard card
+  and the agent-wrapper is restarted.
 - Events are acked by sequence; if the agent-wrapper is offline, Central-Dispatch holds events
   and replays them on reconnect.
 

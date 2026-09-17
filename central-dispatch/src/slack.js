@@ -17,6 +17,12 @@ export const SLACK_BOT_SCOPES = [
   'users:read',
   'files:write',
   'files:read',
+  // Workspace tools the agent gets over MCP (agent-wrapper slack_tools.py):
+  // list public/private channels, create them, and set topic/invite.
+  'channels:read',
+  'groups:read',
+  'channels:manage',
+  'groups:write',
 ];
 
 const MAX_SKEW_S = 60 * 5; // reject requests older than 5 min (replay protection)
