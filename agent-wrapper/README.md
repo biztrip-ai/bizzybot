@@ -119,8 +119,11 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   (default `300`). The thread's resume id is kept, so the next message in a
   reaped thread transparently resumes the same conversation.
 - **Channels the bot created:** in a channel the bot created itself (Slack's
-  `creator` is the bot), it responds to every message and thread reply, not
-  just @-mentions. System notices (joins, topic changes…) are ignored. The
+  `creator` is the bot), it responds to every top-level post, not just
+  @-mentions, and answers at top level rather than in a thread. Those posts
+  share one conversation per channel. An @-mention still gets a threaded
+  reply, and only threads started that way get follow-up replies without a
+  re-mention. System notices (joins, topic changes…) are ignored. The
   check uses `conversations.info`, so it needs the `channels:read` /
   `groups:read` scopes; without them those channels behave like any other.
 - **Sender identity:** each Slack message reaches the agent with a first line

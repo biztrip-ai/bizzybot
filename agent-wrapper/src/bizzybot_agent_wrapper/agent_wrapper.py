@@ -400,6 +400,13 @@ async def bot_owns_channel(
     return owned
 
 
+def channel_session_key(channel: str) -> str:
+    """Session key for the top-level conversation in a channel the bot created.
+    Thread sessions are keyed `channel:thread_ts`; this one has no `:`, so
+    `thread_key.partition(":")` yields an empty thread ts for it."""
+    return channel
+
+
 # Threads we've confirmed the bot posted in, so repeat lookups are free. Only
 # "yes" results are cached (a "no" may become "yes" once the bot is @-mentioned).
 _bot_thread_cache: set[str] = set()
@@ -680,7 +687,10 @@ async def flush_background_results(
     session = sessions.get(thread_key)
     if session is None:
         return  # cleared/reaped since the hook fired — don't resurrect it
-    channel, _, reply_ts = thread_key.partition(":")
+    channel, _, thread_ts = thread_key.partition(":")
+    # A channel-level session (see channel_session_key) has no thread: post at
+    # top level.
+    reply_ts = thread_ts or None
     log.info("flush: reporting background results on %s", thread_key)
     renderer = SlackRenderer(slack, channel, reply_ts)
     opened = False  # renderer.open() deferred until there's something to say
@@ -992,26 +1002,30 @@ async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWeb
     if msg is None:
         return  # not addressed to us / an echo — ignore (still acked)
     # A top-level post without an @-mention only reaches the bot in a channel
-    # it created — there it hears everything.
+    # it created. There the bot answers at top level, not in a thread — only an
+    # @-mention opens a thread — and every such post shares one conversation
+    # keyed by the channel alone.
     if msg.pop("needs_owned_channel", False):
         if not await bot_owns_channel(slack, msg["channel"], bot_user_id):
             return
+        msg["thread_key"] = channel_session_key(msg["channel"])
+        msg["reply_thread_ts"] = None
     # A bare channel-thread reply only wakes the bot if it's already engaged in
     # that thread — otherwise any reply in any channel the bot sits in would
     # trigger it. "Engaged" is, cheapest first: a live in-memory session, a
-    # persisted resume id (survives a restart), a channel the bot created, or
-    # — last resort — the bot actually appearing in the thread per
-    # conversations.replies.
+    # persisted resume id (survives a restart), or — last resort — the bot
+    # actually appearing in the thread per conversations.replies. In a channel
+    # the bot created, only the first two count: the bot's own top-level
+    # answers would otherwise make every thread under them "engaged", and a
+    # reply there would start a new conversation with none of the channel's
+    # context. Threads there are for @-mentions.
     if msg.pop("needs_active_session", False):
         thread_key = msg["thread_key"]
-        engaged = (
-            sessions.exists(thread_key)
-            or sessions.has_resume(thread_key)
-            or await bot_owns_channel(slack, msg["channel"], bot_user_id)
-            or await bot_participates_in_thread(
+        engaged = sessions.exists(thread_key) or sessions.has_resume(thread_key)
+        if not engaged and not await bot_owns_channel(slack, msg["channel"], bot_user_id):
+            engaged = await bot_participates_in_thread(
                 slack, msg["channel"], msg["reply_thread_ts"], bot_user_id
             )
-        )
         if not engaged:
             return
     meta = META_COMMANDS.get((msg.get("text") or "").strip().lower())
