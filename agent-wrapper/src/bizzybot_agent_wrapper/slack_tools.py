@@ -230,7 +230,9 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
 
     @tool(
         "create_channel",
-        "Create a new channel in this Slack workspace. The bot becomes a member. "
+        "Create a new channel in this Slack workspace. The bot becomes a member, "
+        "and in channels it created it receives every message, not just "
+        "@-mentions. "
         "Optionally set its topic and purpose and invite people by user id "
         "(see list_users). Names must be lowercase, max 80 chars, with no spaces "
         "or periods.",

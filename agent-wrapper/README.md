@@ -92,7 +92,8 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 
 ## Behaviour
 
-- Responds to **@-mentions** and **direct messages**.
+- Responds to **@-mentions**, **direct messages**, and every message in
+  channels the bot created.
 - Streams replies into a single Slack message, edited in place.
 - Meta commands: `!stop` (interrupt the running turn), `!clear` (reset the
   thread's session), `!help`.
@@ -117,6 +118,11 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   (default `14400` = 4h; `0` disables), scanning every `SESSION_REAP_INTERVAL_S`
   (default `300`). The thread's resume id is kept, so the next message in a
   reaped thread transparently resumes the same conversation.
+- **Channels the bot created:** in a channel the bot created itself (Slack's
+  `creator` is the bot), it responds to every message and thread reply, not
+  just @-mentions. System notices (joins, topic changes…) are ignored. The
+  check uses `conversations.info`, so it needs the `channels:read` /
+  `groups:read` scopes; without them those channels behave like any other.
 - **Sender identity:** each Slack message reaches the agent with a first line
   naming who wrote it, e.g. `[Slack message from Jane Doe (@jane), user ID
   U0123 — mention as <@U0123>]`, so it can mention or invite that person
