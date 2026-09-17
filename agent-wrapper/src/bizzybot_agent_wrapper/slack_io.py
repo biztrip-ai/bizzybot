@@ -275,6 +275,39 @@ async def upload_files(
             log.exception("files_upload_v2 failed for %s", p)
 
 
+# users.info results by user id: (fetched_at, label). Names change rarely; an
+# hour keeps a renamed user from being stale for long.
+_USER_LABEL_TTL_S = 3600.0
+_user_labels: dict[str, tuple[float, str]] = {}
+
+
+async def sender_line(slack: AsyncWebClient, user_id: str) -> str:
+    """A one-line header naming who wrote a Slack message, prepended to the
+    agent's prompt so it knows who it's talking to without asking. Falls back
+    to the bare id if the lookup fails."""
+    now = time.monotonic()
+    cached = _user_labels.get(user_id)
+    if cached and now - cached[0] < _USER_LABEL_TTL_S:
+        label = cached[1]
+    else:
+        label = ""
+        try:
+            resp = await slack.users_info(user=user_id)
+            u = resp.get("user") or {}
+            p = u.get("profile") or {}
+            name = p.get("real_name") or u.get("real_name") or ""
+            handle = p.get("display_name") or u.get("name") or ""
+            if name and handle and handle != name:
+                label = f"{name} (@{handle})"
+            else:
+                label = name or (f"@{handle}" if handle else "")
+            _user_labels[user_id] = (now, label)
+        except Exception:  # noqa: BLE001 — a missing name mustn't block the turn
+            log.warning("users.info failed for %s", user_id, exc_info=True)
+    who = f"{label}, " if label else ""
+    return f"[Slack message from {who}user ID {user_id} — mention as <@{user_id}>]"
+
+
 def _clip(s: str, n: int = 80) -> str:
     s = " ".join((s or "").split())
     return s if len(s) <= n else s[: n - 1] + "…"

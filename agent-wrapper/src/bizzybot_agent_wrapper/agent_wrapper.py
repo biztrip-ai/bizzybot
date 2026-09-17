@@ -40,7 +40,14 @@ from . import email_reply, pr_poller, sentry_poller, slack_tools, support_hook
 from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
-from .slack_io import SlackRenderer, download_slack_files, upload_files, tool_label, ATTACH_RE
+from .slack_io import (
+    ATTACH_RE,
+    SlackRenderer,
+    download_slack_files,
+    sender_line,
+    tool_label,
+    upload_files,
+)
 
 load_dotenv()
 
@@ -66,7 +73,13 @@ To attach a file (screenshot, image, document) to your reply, save it to disk
 and put its absolute path on its own line prefixed with `ATTACH:`, e.g.:
   ATTACH: /path/to/shot.png
 Emit one ATTACH line per file. The file is uploaded to this thread; the ATTACH
-line itself is removed from your message, so write a normal sentence too."""
+line itself is removed from your message, so write a normal sentence too.
+
+A message typed by a person in Slack starts with a line like
+  [Slack message from Jane Doe (@jane), user ID U0123 — mention as <@U0123>]
+naming who wrote it. Several people can post in one thread, so check it on each
+message. Use that user ID when you need theirs (to mention, invite or look them
+up) instead of asking for it. The line is added by the bridge, not the person."""
 
 # Every thread runs in the same cwd (see build_session_manager), concurrently, so
 # the agent has to isolate its own edits and clean up what it starts. Advisory —
@@ -436,6 +449,7 @@ def normalize_slack_event(
         "reply_thread_ts": thread_ts,
         "text": text,
         "files": event.get("files") or [],
+        "user": event.get("user"),
         "needs_active_session": needs_active_session,
     }
 
@@ -463,6 +477,9 @@ async def handle_user_message(
             text = (f"{text}\n\n" if text else "") + (
                 f"The user attached these files (local paths, read them as needed):\n{listing}"
             )
+    user_id = payload.get("user")
+    if user_id:
+        text = f"{await sender_line(slack, user_id)}\n\n{text}"
 
     log.info("message thread=%s channel=%s len=%d files=%d", thread_key, channel, len(text), len(files))
     session = await sessions.get_or_create(thread_key)
