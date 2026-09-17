@@ -36,7 +36,7 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import email_reply, pr_poller, sentry_poller, support_hook
+from . import email_reply, pr_poller, sentry_poller, slack_tools, support_hook
 from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
@@ -266,7 +266,10 @@ def preflight() -> None:
 # --- Session manager --------------------------------------------------------
 
 
-def build_session_manager(settings: Optional[dict[str, str]] = None) -> SessionManager:
+def build_session_manager(
+    settings: Optional[dict[str, str]] = None,
+    slack: Optional[AsyncWebClient] = None,
+) -> SessionManager:
     extra_args: dict[str, str | None] = {}
     # Chrome (Claude-in-Chrome browser MCP) is on by default so target envs don't
     # each have to set it; disable explicitly with CLAUDE_CHROME=0.
@@ -277,6 +280,18 @@ def build_session_manager(settings: Optional[dict[str, str]] = None) -> SessionM
     mcp_servers = (
         load_cli_mcp_servers(cwd) if _truthy(os.getenv("CLAUDE_LOAD_CLI_MCP", "1")) else {}
     )
+    prompt = f"{SLACK_FORMATTING_PROMPT}\n\n{WORKSPACE_PROMPT}"
+    # Workspace tools (list channels/users, create channel) backed by the bot
+    # token. On by default; disable with CLAUDE_SLACK_MCP=0. Added after the CLI
+    # servers so a user server with the same name can't shadow it.
+    if slack is not None and _truthy(os.getenv("CLAUDE_SLACK_MCP", "1")):
+        if slack_tools.SERVER_NAME in mcp_servers:
+            log.warning(
+                "MCP server %r from claude CLI config replaced by bizzybot's Slack tools",
+                slack_tools.SERVER_NAME,
+            )
+        mcp_servers[slack_tools.SERVER_NAME] = slack_tools.build_slack_mcp_server(slack)
+        prompt += f"\n\n{slack_tools.TOOLS_PROMPT}"
     # The user's settings file (~/.bizzybot/settings.env) — passed through to
     # each claude subprocess, and the source of an alternate model provider.
     # main() loads it once and passes it in, so it isn't parsed (and logged) twice.
@@ -299,7 +314,7 @@ def build_session_manager(settings: Optional[dict[str, str]] = None) -> SessionM
             os.getenv("CLAUDE_SETTING_SOURCES", "user,project,local")
         ),
         extra_args=extra_args,
-        system_prompt_append=f"{SLACK_FORMATTING_PROMPT}\n\n{WORKSPACE_PROMPT}",
+        system_prompt_append=prompt,
         mcp_servers=mcp_servers,
         env=env,
         # Screenshots/images the agent Reads back arrive as one big base64 JSON
@@ -1192,9 +1207,9 @@ async def main() -> None:
             sys.exit("Central-Dispatch did not return WebSocket details")
 
         settings = load_settings()
-        sessions = build_session_manager(settings)
-        sessions.start_reaper()
         slack = AsyncWebClient(token=slack_token)
+        sessions = build_session_manager(settings, slack)
+        sessions.start_reaper()
 
         # PR review poller. Off unless PR_REVIEW_CHANNEL is set — the same
         # "unconfigured means no-op" shape as Central's email poller.
