@@ -9,6 +9,8 @@ import {
   getAgentById,
   listAgentsByTeam,
   setAgentSlack,
+  claimAgentSponsor,
+  setAgentSponsor,
   markRegistered,
   listAgents,
   appendEvent,
@@ -20,6 +22,7 @@ import { pushEvent, onlineIds, claimOfflineNotice } from './wsHub.js';
 import { getSession, setSession, clearSession } from './session.js';
 import {
   SLACK_BOT_SCOPES,
+  userName,
   verifySlackSignature,
   exchangeCode,
   buildManifest,
@@ -131,6 +134,15 @@ router.get('/dashboard', async (req, res) => {
 
   const workspace = sess.teamName || sess.teamId;
   const agents = await listAgentsByTeam(sess.teamId);
+  // Sponsor ids -> names, so the cards read "Scott Persinger" and not "U0123".
+  // One users.info per distinct sponsor (cached in slack.js), best-effort.
+  const sponsorNames = new Map();
+  for (const a of agents) {
+    const id = a.sponsor_slack_user_id;
+    if (!id || sponsorNames.has(id)) continue;
+    const full = await getAgentById(a.id);
+    sponsorNames.set(id, (await userName(full?.slack_bot_token, id)) || null);
+  }
   const ws = await getWorkspaceSettings(sess.teamId);
   const emailDomain = ws?.mailgun_domain || '';
   const online = onlineIds();
@@ -179,6 +191,27 @@ router.get('/dashboard', async (req, res) => {
         </div>
       </form>`;
 
+  // The agent's sponsor — the human responsible for it, and the only Slack user
+  // it runs shell commands for. Claimed by whoever first installed the app; the
+  // signed-in user can take it over here.
+  const sponsorLine = (agent) => {
+    const sponsor = agent.sponsor_slack_user_id || '';
+    const mine = sponsor && sponsor === sess.userId;
+    const named = sponsorNames.get(sponsor) || sponsor;
+    const who = sponsor
+      ? `<b>${mine ? `you (${escapeHtml(named)})` : escapeHtml(named)}</b>`
+      : '<span style="color:#a60">none</span> — nobody can run <code>!!</code> shell commands';
+    const takeOver =
+      mine || !sess.userId
+        ? ''
+        : `<form method="post" action="/dashboard/agent-sponsor" style="display:inline;margin-left:8px">
+             <input type="hidden" name="agentId" value="${escapeHtml(agent.id)}">
+             <button type="submit" style="border:0;background:none;color:#4A154B;text-decoration:underline;cursor:pointer;padding:0;font-size:inherit"
+               title="Make yourself the human responsible for this agent. The sponsor is the only Slack user it will run !! shell commands for.">make me the sponsor</button>
+           </form>`;
+    return `<p style="margin:0 0 8px;font-size:13px;color:#666">Sponsor: ${who}${takeOver}</p>`;
+  };
+
   // `reinstallable` is false for orphans: their app is no longer configured, and
   // /slack/install would fall back to the primary app.
   const agentCard = (app, agent, i, reinstallable = true) => {
@@ -196,6 +229,7 @@ router.get('/dashboard', async (req, res) => {
     const tokId = `regtok-${i}`;
     return `<div style="${cardStyle}">
       <h3 style="margin:0 0 8px">${label}</h3>
+      ${sponsorLine(agent)}
       <p style="margin:0 0 12px">Slack: <b>✅ installed</b> · Agent: <b>${status}</b>${
         reinstallable
           ? ` · <a href="${installUrl(app)}" title="Re-run the Slack install to grant newly added permissions. Keeps this agent and its token; restart the agent-wrapper afterwards.">Reinstall</a>`
@@ -308,6 +342,19 @@ router.post('/dashboard/agent-email', async (req, res) => {
   res.redirect('/dashboard');
 });
 
+// Hand an agent's sponsorship to the signed-in user (same workspace only).
+router.post('/dashboard/agent-sponsor', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.redirect('/login');
+  const { agentId } = req.body || {};
+  const agent = agentId ? await getAgentById(agentId) : null;
+  if (!agent || agent.slack_team_id !== sess.teamId || !sess.userId) {
+    return res.status(403).send('forbidden');
+  }
+  await setAgentSponsor(agentId, sess.userId);
+  res.redirect('/dashboard');
+});
+
 router.get('/slack/install', (req, res) => {
   // Which app to install (?app=<App ID>); default to the primary app.
   const app = config.slack.appById(req.query.app) || config.slack.primary;
@@ -358,14 +405,22 @@ router.get('/slack/oauth/callback', async (req, res) => {
     const legacy = await getAgentByTeam(teamId);
     if (legacy && !legacy.slack_app_id) existing = legacy;
   }
+  let agentId;
   if (existing) {
     await setAgentSlack(existing.id, { teamId, appId, botToken });
     registrationToken = existing.registration_token;
+    agentId = existing.id;
   } else {
     const agent = await createAgent(agentName);
     await setAgentSlack(agent.id, { teamId, appId, botToken });
     registrationToken = agent.registrationToken;
+    agentId = agent.id;
   }
+  // The installer sponsors the agent — the human responsible for it, and the
+  // only Slack user it will run shell commands for. Sticky: a later reinstall
+  // by someone else leaves the original sponsor in place (the dashboard hands
+  // it over deliberately).
+  await claimAgentSponsor(agentId, data.authed_user?.id || null);
 
   // Log the installer in and land them on the dashboard (which shows the token
   // + live status for every agent in this workspace).
@@ -399,6 +454,7 @@ router.post('/api/register', async (req, res) => {
   res.json({
     agentId: agent.id,
     slackBotToken: agent.slack_bot_token || config.slack.botToken,
+    sponsorSlackUserId: agent.sponsor_slack_user_id || null,
     ws: { url: wsUrl, token },
   });
 });

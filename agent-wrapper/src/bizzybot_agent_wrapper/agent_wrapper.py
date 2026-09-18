@@ -45,6 +45,7 @@ from .slack_io import (
     SlackRenderer,
     download_slack_files,
     sender_line,
+    user_label,
     tool_label,
     upload_files,
 )
@@ -279,9 +280,19 @@ def preflight() -> None:
 # --- Session manager --------------------------------------------------------
 
 
+def sponsor_prompt(sponsor_id: str, label: str) -> str:
+    who = f"{label} " if label else ""
+    return (
+        f"""Your sponsor is {who}<@{sponsor_id}> (Slack user ID {sponsor_id}) — the """
+        "human responsible for this agent. When a request is ambiguous or risky "
+        "and they aren't the one asking, their call is the one that settles it."
+    )
+
+
 def build_session_manager(
     settings: Optional[dict[str, str]] = None,
     slack: Optional[AsyncWebClient] = None,
+    sponsor_prompt_line: Optional[str] = None,
 ) -> SessionManager:
     extra_args: dict[str, str | None] = {}
     # Chrome (Claude-in-Chrome browser MCP) is on by default so target envs don't
@@ -305,6 +316,8 @@ def build_session_manager(
             )
         mcp_servers[slack_tools.SERVER_NAME] = slack_tools.build_slack_mcp_server(slack)
         prompt += f"\n\n{slack_tools.TOOLS_PROMPT}"
+    if sponsor_prompt_line:
+        prompt += f"\n\n{sponsor_prompt_line}"
     # The user's settings file (~/.bizzybot/settings.env) — passed through to
     # each claude subprocess, and the source of an alternate model provider.
     # main() loads it once and passes it in, so it isn't parsed (and logged) twice.
@@ -1288,7 +1301,22 @@ async def main() -> None:
 
         settings = load_settings()
         slack = AsyncWebClient(token=slack_token)
-        sessions = build_session_manager(settings, slack)
+        # The agent's sponsor: the Slack user who installed it (Central-Dispatch
+        # keeps it). Named in the system prompt, and the only user allowed to run
+        # shell commands through the bridge. None for an agent installed before
+        # sponsors existed — it gets one on the next reinstall.
+        sponsor_id = reg.get("sponsorSlackUserId") or os.getenv("SPONSOR_SLACK_USER_ID") or ""
+        sponsor_line = None
+        if sponsor_id:
+            label = await user_label(slack, sponsor_id)
+            sponsor_line = sponsor_prompt(sponsor_id, label)
+            log.info("sponsor: %s%s", f"{label} " if label else "", sponsor_id)
+        else:
+            log.warning(
+                "no sponsor for this agent — reinstall the Slack app from the "
+                "dashboard to set one"
+            )
+        sessions = build_session_manager(settings, slack, sponsor_line)
         sessions.start_reaper()
 
         # PR review poller. Off unless PR_REVIEW_CHANNEL is set — the same

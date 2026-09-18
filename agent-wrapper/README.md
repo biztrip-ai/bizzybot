@@ -126,6 +126,11 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   re-mention. System notices (joins, topic changes…) are ignored. The
   check uses `conversations.info`, so it needs the `channels:read` /
   `groups:read` scopes; without them those channels behave like any other.
+- **Sponsor:** the human responsible for this agent — the Slack user who
+  installed it (Central-Dispatch keeps it and returns it at registration; the
+  dashboard can hand it over). The system prompt names them, so the agent knows
+  whose call settles an ambiguous or risky request. `SPONSOR_SLACK_USER_ID`
+  overrides it locally for development.
 - **Sender identity:** each Slack message reaches the agent with a first line
   naming who wrote it, e.g. `[Slack message from Jane Doe (@jane), user ID
   U0123 — mention as <@U0123>]`, so it can mention or invite that person
