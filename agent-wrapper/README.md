@@ -97,6 +97,16 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 - Streams replies into a single Slack message, edited in place.
 - Meta commands: `!stop` (interrupt the running turn), `!clear` (reset the
   thread's session), `!help`.
+- **`!!` shell commands:** a message starting with `!!` runs the rest as a
+  shell command in `CLAUDE_CWD` and posts the output back — no Claude turn
+  involved. **Only the agent's sponsor may do this**, and only when a sponsor
+  is set. Slack's escaping, link wrapping, code formatting and smart quotes are
+  undone first. One command at a time per thread; `!stop` kills it and
+  everything it started. Output over ~2400 chars is shown as a tail with the
+  whole thing attached as a file, and the command and its output are handed to
+  the agent with your next message in that thread (like Claude Code's own `!`
+  prefix), so `!! npm test` then "fix those failures" works. Tunable with
+  `SHELL_TIMEOUT_S` (default 120); `SHELL_COMMANDS=0` disables it.
 - **Serialized turns:** a second message in a thread whose turn is still running
   waits behind it, showing a *"⏳ queued…"* placeholder until it starts.
 - **Background sub-agent flush:** if the agent launches background sub-agents

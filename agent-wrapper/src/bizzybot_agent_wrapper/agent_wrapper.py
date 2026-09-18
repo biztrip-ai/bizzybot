@@ -26,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Any, Awaitable, Callable, Optional
@@ -36,7 +37,7 @@ import aiohttp
 from dotenv import load_dotenv
 from slack_sdk.web.async_client import AsyncWebClient
 
-from . import email_reply, pr_poller, sentry_poller, slack_tools, support_hook
+from . import email_reply, pr_poller, sentry_poller, shell_exec, slack_tools, support_hook
 from .paths import log_path, state_path
 from .session_manager import SessionManager, load_cli_mcp_servers
 from .settings import claude_env, load_settings, resolve
@@ -278,6 +279,70 @@ def preflight() -> None:
 
 
 # --- Session manager --------------------------------------------------------
+
+
+# The agent's sponsor (Slack user id) and the `!!` shell runner, both set in
+# main(). `!!` stays off while either is None: no sponsor means nobody is
+# allowed to run commands.
+SPONSOR_USER_ID: Optional[str] = None
+SHELL_RUNNER: Optional[shell_exec.Runner] = None
+
+
+async def handle_shell_command(
+    payload: dict[str, Any], command: str, slack: AsyncWebClient
+) -> None:
+    """Run a `!!` command for the sponsor and post the result to the thread."""
+    channel = payload.get("channel")
+    reply_ts = payload.get("reply_thread_ts")
+    thread_key = payload.get("thread_key") or ""
+    user = payload.get("user")
+    if SHELL_RUNNER is None or not SPONSOR_USER_ID:
+        log.warning("!! from %s ignored: no sponsor set for this agent", user)
+        await slack.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=":no_entry: `!!` needs a sponsor for this agent — set one on the "
+                 "Bizzybot dashboard, then restart the agent-wrapper.",
+        )
+        return
+    if user != SPONSOR_USER_ID:
+        log.warning("!! REFUSED for %s (sponsor is %s): %s", user, SPONSOR_USER_ID, command)
+        await slack.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=f":no_entry: only this agent's sponsor (<@{SPONSOR_USER_ID}>) can run "
+                 "`!!` shell commands.",
+        )
+        return
+    if SHELL_RUNNER.is_running(thread_key):
+        await slack.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=":hourglass: a `!!` command is still running in this thread — "
+                 "`!stop` it first.",
+        )
+        return
+
+    log.info("!! from sponsor %s on %s: %s", user, thread_key, command)
+    renderer = SlackRenderer(slack, channel, reply_ts)
+    await renderer.open()
+    await renderer.status(f"💻 {command}")
+    try:
+        result = await SHELL_RUNNER.run(thread_key, command)
+    except Exception as e:  # noqa: BLE001 — a bad command must not kill the bridge
+        log.exception("!! failed to run: %s", command)
+        await renderer.replace_with(f":warning: `!!` failed to run: `{e}`")
+        return
+    renderer.clear_status()
+    await renderer.replace_with(result.slack_text())
+    # The whole output, when the message only showed its tail.
+    if len(result.output) > shell_exec.MAX_SLACK_CHARS:
+        path = os.path.join(
+            tempfile.gettempdir(), f"bizzybot-shell-{int(time.time())}.txt"
+        )
+        try:
+            with open(path, "w") as fh:
+                fh.write(f"$ {result.command}\n({result.status()})\n\n{result.output}")
+            await upload_files(slack, channel, reply_ts, [path])
+        except OSError:
+            log.warning("couldn't write full !! output to %s", path, exc_info=True)
 
 
 def sponsor_prompt(sponsor_id: str, label: str) -> str:
@@ -539,6 +604,13 @@ async def handle_user_message(
             text = (f"{text}\n\n" if text else "") + (
                 f"The user attached these files (local paths, read them as needed):\n{listing}"
             )
+    # `!!` commands the sponsor ran in this thread since the agent last heard
+    # from us. Claude Code's own `!` prefix works the same way: the command and
+    # its output become part of the conversation.
+    if SHELL_RUNNER is not None:
+        pending = SHELL_RUNNER.take_pending(thread_key)
+        if pending:
+            text = "\n\n".join([r.agent_text() for r in pending] + ([text] if text else []))
     user_id = payload.get("user")
     if user_id:
         text = f"{await sender_line(slack, user_id)}\n\n{text}"
@@ -975,6 +1047,9 @@ async def handle_stop(payload: dict, sessions: SessionManager, slack: AsyncWebCl
         return
     session = sessions.get(thread_key)
     stopped = await session.interrupt() if session else False
+    # A `!!` command runs outside any session, so stop that too.
+    if SHELL_RUNNER is not None and SHELL_RUNNER.stop(thread_key):
+        stopped = True
     await slack.chat_postMessage(
         channel=channel, thread_ts=reply_ts,
         text=":octagonal_sign: stopped." if stopped else "_Nothing running._",
@@ -993,6 +1068,7 @@ META_COMMANDS: dict[str, tuple[Callable[..., Awaitable[None]], str]] = {
     "!stop": (handle_stop, "interrupt the turn currently running"),
     "!clear": (handle_clear, "reset this thread's session"),
     "!help": (handle_help, "show this list"),
+    "!! <command>": (handle_help, "run a shell command here (sponsor only)"),
 }
 
 
@@ -1044,8 +1120,12 @@ async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWeb
     meta = META_COMMANDS.get((msg.get("text") or "").strip().lower())
     if meta:
         await meta[0](msg, sessions, slack)
-    else:
-        await handle_user_message(msg, sessions, slack)
+        return
+    command = shell_exec.parse_command(msg.get("text") or "")
+    if command:
+        await handle_shell_command(msg, command, slack)
+        return
+    await handle_user_message(msg, sessions, slack)
 
 
 # --- Delivery cursor --------------------------------------------------------
@@ -1316,6 +1396,18 @@ async def main() -> None:
                 "no sponsor for this agent — reinstall the Slack app from the "
                 "dashboard to set one"
             )
+        # `!!` shell execution, for the sponsor only. Off when the agent has no
+        # sponsor, or when SHELL_COMMANDS=0.
+        global SPONSOR_USER_ID, SHELL_RUNNER
+        SPONSOR_USER_ID = sponsor_id or None
+        if sponsor_id and _truthy(os.getenv("SHELL_COMMANDS", "1")):
+            shell_env, _ = claude_env(settings)
+            SHELL_RUNNER = shell_exec.Runner(
+                cwd=os.getenv("CLAUDE_CWD") or os.getcwd(),
+                timeout_s=float(os.getenv("SHELL_TIMEOUT_S", shell_exec.DEFAULT_TIMEOUT_S)),
+                env=shell_env,
+            )
+            log.info("!! shell commands enabled for the sponsor")
         sessions = build_session_manager(settings, slack, sponsor_line)
         sessions.start_reaper()
 

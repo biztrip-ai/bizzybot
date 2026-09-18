@@ -85,6 +85,22 @@ Install by cloning the repo and linking into `~/.claude/skills`.
 
 You should write your own skills to help Claude run / test / debug your app.
 
+## Running shell commands from Slack
+
+A message starting with `!!` runs the rest as a shell command on the machine
+running the agent-wrapper, in the agent's working directory, and posts the
+output back to the thread:
+
+```
+!! git status
+!! npm test
+```
+
+Only the agent's **sponsor** — the Slack user who installed it, shown on the
+dashboard — can do this. Nobody else can, and a command's output is also given
+to the agent with your next message in that thread, so you can follow `!! npm
+test` with "fix those failures". `!stop` kills a running command.
+
 ## Pushing code from your agent
 
 We created a separate Github user account to use for our bot. This gives you bot a full Github idenity but
