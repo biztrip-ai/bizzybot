@@ -771,6 +771,7 @@ class SessionManager:
         setting_sources: Optional[list[str]] = None,
         extra_args: Optional[dict[str, Optional[str]]] = None,
         system_prompt_append: Optional[str] = None,
+        system_prompt_file: Optional[str] = None,
         mcp_servers: Optional[dict[str, dict]] = None,
         env: Optional[dict[str, str]] = None,
         max_buffer_size: Optional[int] = None,
@@ -787,6 +788,11 @@ class SessionManager:
         # the provider vars derived from it).
         self._env = env or {}
         self._system_prompt_append = system_prompt_append
+        # A per-agent role file (AGENT_PROMPT_FILE), appended after the bridge's
+        # own prompt. Read each time a session is built, not once at startup, so
+        # an edited file (e.g. a protocol that arrived with `git pull`) reaches
+        # the next conversation without restarting the bridge.
+        self._system_prompt_file = system_prompt_file
         # Each session pins a ~80-130MB claude subprocess. If set, a background
         # reaper closes sessions idle longer than this many seconds. The
         # persisted resume id is kept, so the next message in a reaped thread
@@ -877,13 +883,29 @@ class SessionManager:
             kwargs["max_buffer_size"] = self._max_buffer_size
         if self._extra_args:
             kwargs["extra_args"] = dict(self._extra_args)
-        if self._system_prompt_append:
+        append = "\n\n".join(
+            p for p in (self._system_prompt_append, self._read_prompt_file()) if p
+        )
+        if append:
             kwargs["system_prompt"] = {
                 "type": "preset",
                 "preset": "claude_code",
-                "append": self._system_prompt_append,
+                "append": append,
             }
         return ClaudeAgentOptions(**kwargs)
+
+    def _read_prompt_file(self) -> Optional[str]:
+        if not self._system_prompt_file:
+            return None
+        try:
+            with open(self._system_prompt_file, encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError as e:
+            # A missing role file shouldn't take the agent down; it just runs
+            # without its role until the file is back.
+            log.warning("AGENT_PROMPT_FILE %s unreadable: %s", self._system_prompt_file, e)
+            return None
+        return text or None
 
     async def get_or_create(self, key: str) -> Session:
         async with self._lock:
