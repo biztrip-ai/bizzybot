@@ -186,6 +186,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "claude-agent-sdk" },
+    { name = "cryptography" },
     { name = "python-dotenv" },
     { name = "slack-sdk" },
 ]
@@ -194,6 +195,7 @@ dependencies = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "slack-sdk", specifier = ">=3.27.0" },
 ]

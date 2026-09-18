@@ -157,6 +157,38 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 - Events are acked by sequence; if the agent-wrapper is offline, Central-Dispatch holds events
   and replays them on reconnect.
 
+## Receiving secrets: `bizzybot-dropbox`
+
+To get a token, key or env var value onto an agent box without pasting it into
+chat or a terminal, request it through a one-time dropbox page on
+Central-Dispatch:
+
+```sh
+bizzybot-dropbox request --restart \
+  --note "Tokens for the new BzPM box" \
+  'env:REGISTRATION_TOKEN::48-char token from the BzPM card on the dashboard' \
+  'settings:OPENROUTER_API_KEY' \
+  'file:deploy_key:/workspaces/.ssh/deploy_key::private key, PEM'
+```
+
+The command prints a URL and a check code, then waits. Whoever opens the URL
+sees the note, the check code (it should match the one printed here) and one
+field per item. Their browser encrypts the values to a key pair generated on
+this box, so Central-Dispatch only ever relays ciphertext. The box then
+decrypts the values, installs them and prints only names and lengths:
+
+| Spec | Installed to |
+|---|---|
+| `env:NAME` | upserted in `/workspaces/env/agent.env` if that exists, otherwise `$BIZZYBOT_STATE_DIR/.env` (or `--env-file`) |
+| `settings:NAME` | upserted in `$BIZZYBOT_STATE_DIR/settings.env` |
+| `file:NAME:/abs/path` | written to that file, mode 0600 (multi-line) |
+
+The link can be used once and expires (`--ttl`, default 30 min). The page
+needs no sign-in: anyone with the link can *submit*, but nobody can read.
+The box installs nothing unless the submission holds exactly the names it
+requested, and env values must be a single line. It works before the agent
+has registered, so it can deliver `REGISTRATION_TOKEN` itself.
+
 ## State files
 
 Kept in `~/.bizzybot/` (override with `BIZZYBOT_STATE_DIR`):
