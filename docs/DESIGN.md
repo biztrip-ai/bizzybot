@@ -193,6 +193,26 @@ The agent-wrapper posts the reply to Slack **directly** using the Slack token it
 retrieved at registration. (Alternative — send it back up the WebSocket and let
 Central-Dispatch post it — is noted in Open Questions.)
 
+### 5. Secret dropbox (human → box, end-to-end encrypted)
+
+`bizzybot-dropbox request` (agent-wrapper/src/bizzybot_agent_wrapper/dropbox.py)
+generates an RSA-3072 key pair on the box. It then calls `POST /api/dropbox`
+with the public key, the requested item names and a note, and gets back an id
+and a pickup secret; Central-Dispatch stores only the secret's hash.
+`GET /drop/:id` serves a page (CSP nonce, `no-store`, `no-referrer`) whose
+script encrypts the values in the browser:
+
+1. It generates a random AES-256-GCM key and encrypts `{"items": {...}}`
+   with it, using the dropbox id as the AAD.
+2. It wraps that AES key with RSA-OAEP(SHA-256).
+3. It posts `{wrapped_key, iv, ciphertext}` to `/api/dropbox/:id/submit`,
+   which accepts one submission only.
+
+The box polls `GET /api/dropbox/:id/result` with its pickup secret. The row is
+deleted when the result is handed over, and expired rows are swept. The check
+code shown on both sides is the first 6 base-31 characters of
+SHA-256(SPKI of the public key).
+
 ## Repo layout
 
 Two self-contained apps at the top level — no workspace/monorepo tooling. The

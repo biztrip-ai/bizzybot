@@ -4,6 +4,7 @@ import express from 'express';
 import { config } from './config.js';
 import { init } from './db.js';
 import { router } from './routes.js';
+import { dropboxRouter, initDropboxTable } from './dropbox.js';
 import { attachWsHub } from './wsHub.js';
 import { startEmailPoller } from './email_poller.js';
 import { ensureSelfSignedCert } from './cert.js';
@@ -23,8 +24,10 @@ app.use(express.urlencoded({ extended: false }));
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use(router);
+app.use(dropboxRouter);
 
 await init(); // create tables / schema before serving
+await initDropboxTable();
 
 const server = config.tlsSelfSigned
   ? https.createServer(ensureSelfSignedCert(config.certDir), app)
