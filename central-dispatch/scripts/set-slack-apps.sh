@@ -10,6 +10,10 @@
 #
 # Run it yourself in a terminal:  ./central-dispatch/scripts/set-slack-apps.sh
 #
+# With --append, it starts from the apps already in SLACK_APPS and only asks for
+# the new ones, so adding an app doesn't mean re-entering every other app's
+# secrets. Entering an App ID that's already there replaces that app's entry.
+#
 set -euo pipefail
 
 # Railway target (override via env if needed).
@@ -20,12 +24,33 @@ SERVICE="${RAILWAY_SERVICE:-claudebot}"
 command -v railway >/dev/null || { echo "railway CLI not found on PATH"; exit 1; }
 command -v node    >/dev/null || { echo "node not found on PATH"; exit 1; }
 
+APPEND=0
+[ "${1:-}" = "--append" ] && APPEND=1
+
 echo "Configure SLACK_APPS for Central-Dispatch → $SERVICE / $ENVIRONMENT"
-echo "Enter each Slack app. The FIRST app is the primary (dashboard sign-in)."
-echo "Leave 'App name' blank to finish."
+APPS_JSON="[]"
+if [ "$APPEND" -eq 1 ]; then
+  # Current value, read without printing it (it holds every app's secrets).
+  APPS_JSON=$(
+    railway variables -p "$PROJECT" -e "$ENVIRONMENT" -s "$SERVICE" --json |
+      node -e '
+        let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+          const cur = JSON.parse(s).SLACK_APPS;
+          process.stdout.write(cur && cur.trim() ? cur : "[]");
+        });'
+  )
+  echo "Keeping the apps already configured:"
+  APPS_JSON="$APPS_JSON" node -e '
+    for (const a of JSON.parse(process.env.APPS_JSON))
+      console.log(`  - ${a.name}  (appId=${a.appId})`);
+  '
+  echo "Enter the apps to ADD. Leave 'App name' blank to finish."
+else
+  echo "Enter each Slack app. The FIRST app is the primary (dashboard sign-in)."
+  echo "Leave 'App name' blank to finish."
+fi
 echo
 
-APPS_JSON="[]"
 while true; do
   read -rp  "App name (blank to finish): " NAME
   [ -z "$NAME" ] && break
@@ -40,13 +65,17 @@ while true; do
     CLIENTSECRET="$CLIENTSECRET" SIGNINGSECRET="$SIGNINGSECRET" \
     node -e '
       const arr = JSON.parse(process.env.APPS_JSON);
-      arr.push({
+      const app = {
         appId:         process.env.APPID,
         name:          process.env.NAME,
         clientId:      process.env.CLIENTID,
         clientSecret:  process.env.CLIENTSECRET,
         signingSecret: process.env.SIGNINGSECRET,
-      });
+      };
+      // Re-entering an existing App ID replaces that app in place, so the
+      // first (primary) app stays first.
+      const i = arr.findIndex((a) => a.appId === app.appId);
+      if (i >= 0) arr[i] = app; else arr.push(app);
       process.stdout.write(JSON.stringify(arr));
     '
   )

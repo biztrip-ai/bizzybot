@@ -24,6 +24,24 @@ npm start              # or: npm run dev  (node --watch)
 | POST   | `/api/register`       | Agent-Wrapper dials home with its registration token.                 |
 | WS     | `/ws?token=<regtok>&lastSeq=<n>` | Agent event stream (replay + live push).            |
 
+## Adding a Slack app
+
+Each Slack app (Cosmo, Bizzy, …) is one entry in the `SLACK_APPS` JSON variable
+on Railway. To add apps without retyping every existing app's secrets:
+
+```bash
+./central-dispatch/scripts/set-slack-apps.sh --append
+```
+
+It keeps the apps already configured and asks only for the new ones (name, App
+ID, Client ID, Client Secret, Signing Secret — the secrets are read hidden and
+never printed). Re-entering an existing App ID replaces that app in place.
+Without `--append` it replaces the whole list. Railway redeploys to apply it.
+
+On the Slack side, give the new app this deployment's manifest (App Manifest →
+paste the JSON from `GET /slack/manifest?name=<AppName>`), then install it from
+its dashboard card.
+
 ## Sponsors
 
 Each agent has a **sponsor**: the human responsible for it. The Slack user who
