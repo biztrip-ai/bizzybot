@@ -157,6 +157,28 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 - Events are acked by sequence; if the agent-wrapper is offline, Central-Dispatch holds events
   and replays them on reconnect.
 
+## Multi-agent hand-offs
+
+Several agents can pass work to each other in Slack (e.g. a PM agent
+dispatching a builder agent):
+
+- **Waking on another agent:** messages from bots are normally ignored. Set
+  `AGENT_MENTIONS_FROM` to the other agents' Slack user, app or bot ids. A
+  message from one of them wakes this agent only if it @-mentions it with a
+  real `<@U…>` token. The model is told the message came from an agent.
+- **Silence ends the exchange:** when another agent starts a turn and the reply
+  is empty, the "thinking…" placeholder is deleted and nothing is posted.
+  A human's message still gets "_nothing new to report_".
+- **Loop guard:** `AGENT_CHAIN_LIMIT` (default 25) caps how many agent-triggered
+  turns can run in a row. Any human message the agent sees resets the count,
+  and so does a quiet gap of `AGENT_CHAIN_WINDOW_S` (default 600 s).
+- **Role file:** `AGENT_PROMPT_FILE` appends a file, such as a role protocol, to
+  every session's system prompt. It's re-read whenever a conversation starts.
+- **Tools:** the Slack tools include `post_message` (to another channel or
+  thread, with optional files), `read_messages` (a channel's or thread's recent
+  messages) and `add_reaction`. `add_reaction` needs the `reactions:write`
+  scope, so reinstall the app from the dashboard to grant it.
+
 ## Receiving secrets: `bizzybot-dropbox`
 
 To get a token, key or env var value onto an agent box without pasting it into

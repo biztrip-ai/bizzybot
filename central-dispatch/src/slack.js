@@ -23,6 +23,8 @@ export const SLACK_BOT_SCOPES = [
   'groups:read',
   'channels:manage',
   'groups:write',
+  // add_reaction (e.g. a merge agent marking a ticket channel ✅).
+  'reactions:write',
 ];
 
 const MAX_SKEW_S = 60 * 5; // reject requests older than 5 min (replay protection)

@@ -18,6 +18,7 @@ own local git/gh auth. Installed as the `bizzybot` command (see pyproject
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -406,6 +407,7 @@ def build_session_manager(
         ),
         extra_args=extra_args,
         system_prompt_append=prompt,
+        system_prompt_file=os.getenv("AGENT_PROMPT_FILE") or None,
         mcp_servers=mcp_servers,
         env=env,
         # Screenshots/images the agent Reads back arrive as one big base64 JSON
@@ -514,6 +516,117 @@ async def bot_participates_in_thread(
     return False
 
 
+# --- Agent-to-agent mentions -------------------------------------------------
+#
+# Messages from other bots are normally ignored. A multi-agent setup (e.g. a
+# PM agent handing work to a builder agent) needs one agent's @-mention to wake
+# another, so AGENT_MENTIONS_FROM lists the senders allowed through — Slack user
+# ids (U…), app ids (A…) or bot ids (B…), comma-separated. Such a message only
+# wakes this agent if it @-mentions it. AGENT_CHAIN_LIMIT caps how many turns in
+# a row other agents can trigger before a human speaks again: the loop guard.
+
+
+def _agent_allowlist() -> frozenset[str]:
+    raw = os.getenv("AGENT_MENTIONS_FROM", "")
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())
+
+
+def _is_allowed_agent(event: dict[str, Any], allow: frozenset[str]) -> bool:
+    if not allow:
+        return False
+    ids = {event.get("user"), event.get("app_id"), event.get("bot_id"),
+           (event.get("bot_profile") or {}).get("app_id")}
+    return bool(ids & allow)
+
+
+class AgentChainGuard:
+    """Counts agent-triggered turns in a row. Any human message this agent sees
+    resets it (not only ones addressed to it: an agent that only ever hears
+    from other agents would otherwise hit the limit once and stay silent), and
+    so does a quiet gap of `window_s`. Global across threads, because agent
+    ping-pong usually spans new top-level messages rather than one thread."""
+
+    def __init__(self, limit: int, window_s: float):
+        self.limit = limit
+        self.window_s = window_s
+        self.count = 0
+        self._last = 0.0
+
+    def human(self) -> None:
+        self.count = 0
+
+    def allow_agent_turn(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        if now - self._last > self.window_s:
+            self.count = 0
+        self._last = now
+        if self.count >= self.limit:
+            return False
+        self.count += 1
+        return True
+
+
+AGENT_CHAIN = AgentChainGuard(
+    int(os.getenv("AGENT_CHAIN_LIMIT", "25") or 25),
+    float(os.getenv("AGENT_CHAIN_WINDOW_S", "600") or 600),
+)
+
+
+def _is_human_message(event: Any) -> bool:
+    return (
+        isinstance(event, dict)
+        and event.get("type") in ("message", "app_mention")
+        and not event.get("bot_id")
+        and event.get("subtype") in (None, "file_share", "thread_broadcast", "me_message")
+        and bool(event.get("user"))
+    )
+
+# Slack can deliver the same agent message twice — as `app_mention` and as a
+# plain channel `message` — and for bot authors both are needed (app_mention is
+# not guaranteed for them). Remember what we handled to act once.
+_SEEN_AGENT_MSGS: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+
+
+def _first_sighting(key: str) -> bool:
+    if key in _SEEN_AGENT_MSGS:
+        return False
+    _SEEN_AGENT_MSGS[key] = None
+    while len(_SEEN_AGENT_MSGS) > 500:
+        _SEEN_AGENT_MSGS.popitem(last=False)
+    return True
+
+
+def normalize_agent_event(
+    event: dict[str, Any], bot_user_id: Optional[str], allow: frozenset[str]
+) -> Optional[dict[str, Any]]:
+    """A message from an allowlisted agent that @-mentions this agent, as a
+    payload for handle_user_message (tagged from_agent), or None."""
+    if not bot_user_id or event.get("user") == bot_user_id:
+        return None  # never wake on our own messages
+    if not _is_allowed_agent(event, allow):
+        return None
+    if event.get("type") not in ("app_mention", "message"):
+        return None
+    if event.get("subtype") in ("message_changed", "message_deleted", "channel_join"):
+        return None
+    text = event.get("text") or ""
+    if f"<@{bot_user_id}>" not in text:
+        return None
+    channel, ts = event.get("channel"), event.get("ts")
+    if not channel or not ts or not _first_sighting(f"{channel}:{ts}"):
+        return None
+    thread_ts = event.get("thread_ts") or ts
+    return {
+        "thread_key": f"{channel}:{thread_ts}",
+        "channel": channel,
+        "reply_thread_ts": thread_ts,
+        "text": re.sub(r"^\s*<@[UW][A-Z0-9]+>\s*", "", text).strip(),
+        "files": event.get("files") or [],
+        "user": event.get("user"),
+        "from_agent": True,
+    }
+
+
 def normalize_slack_event(
     event: dict[str, Any], bot_user_id: Optional[str] = None
 ) -> Optional[dict[str, Any]]:
@@ -614,6 +727,11 @@ async def handle_user_message(
     user_id = payload.get("user")
     if user_id:
         text = f"{await sender_line(slack, user_id)}\n\n{text}"
+    if payload.get("from_agent"):
+        text = (
+            "[This message is from another agent, not a person. If it isn't a "
+            "hand-off or request for you, reply with nothing at all.]\n\n" + text
+        )
 
     log.info("message thread=%s channel=%s len=%d files=%d", thread_key, channel, len(text), len(files))
     session = await sessions.get_or_create(thread_key)
@@ -667,7 +785,11 @@ async def handle_user_message(
             # user did write to us, so end on something terminal and true instead
             # of a "thinking…" placeholder that never resolves.
             log.info("nothing rendered for %s; closing the message", thread_key)
-            if ATTACH_RE.search("\n".join(full_text)):
+            if payload.get("from_agent") and not ATTACH_RE.search("\n".join(full_text)):
+                # Another agent started this turn and we have nothing to say:
+                # leave no message behind, or the two agents never stop.
+                await renderer.delete()
+            elif ATTACH_RE.search("\n".join(full_text)):
                 await renderer.replace_with("_see attached_")
             else:
                 await renderer.replace_with("_nothing new to report_")
@@ -1086,6 +1208,20 @@ async def dispatch_event(payload: Any, sessions: SessionManager, slack: AsyncWeb
         return
     if SUPPORT_INBOX_HOOK is not None and SUPPORT_INBOX_HOOK.matches(payload, bot_user_id):
         await SUPPORT_INBOX_HOOK.handle(payload)
+        return
+    if _is_human_message(payload):
+        AGENT_CHAIN.human()
+    if isinstance(payload, dict) and payload.get("bot_id"):
+        msg = normalize_agent_event(payload, bot_user_id, _agent_allowlist())
+        if msg is None:
+            return  # another bot's message not meant for us (or not allowlisted)
+        if not AGENT_CHAIN.allow_agent_turn():
+            log.warning(
+                "agent chain limit (%d) reached; ignoring agent message in %s until a human speaks",
+                AGENT_CHAIN.limit, msg["thread_key"],
+            )
+            return
+        await handle_user_message(msg, sessions, slack)
         return
     msg = normalize_slack_event(payload, bot_user_id)
     if msg is None:

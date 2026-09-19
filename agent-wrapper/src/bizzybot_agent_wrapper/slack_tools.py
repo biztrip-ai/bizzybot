@@ -23,6 +23,8 @@ from mcp.types import ToolAnnotations
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
+from .slack_io import upload_files
+
 log = logging.getLogger("agent-wrapper.slack-tools")
 
 SERVER_NAME = "bizzybot"
@@ -33,10 +35,14 @@ PAGE_SIZE = 200
 
 TOOLS_PROMPT = """\
 You have `mcp__bizzybot__*` tools for the Slack workspace you're talking in
-(list_channels, list_users, create_channel, archive_channel). Use them for
-anything about this workspace. Other Slack tools you may have can point at a
-different workspace. Only archive a channel when the person asked for that
-specific channel to be archived."""
+(list_channels, list_users, create_channel, archive_channel, post_message,
+read_messages, add_reaction). Use them for anything about this workspace. Other
+Slack tools you may have can point at a different workspace. Only archive a
+channel when the person asked for that specific channel to be archived.
+Your reply to the current conversation is posted for you; use post_message
+only to write somewhere else (another channel or thread). To notify a person
+or agent, include their mention token `<@USERID>` (ids from list_users);
+plain "@name" text notifies nobody."""
 
 # Slack error codes from conversations.archive, explained so the agent can tell
 # the person what to do instead of retrying.
@@ -169,6 +175,29 @@ async def _resolve_channel(slack: AsyncWebClient, ref: str) -> Optional[dict[str
         if (c.get("name") or "").lower() == name:
             return c
     return None
+
+
+# Longest message text read_messages returns per message; the rest is cut.
+MAX_READ_TEXT = 4000
+
+
+def _message_row(m: dict[str, Any]) -> dict[str, Any]:
+    text = m.get("text") or ""
+    row: dict[str, Any] = {
+        "ts": m.get("ts"),
+        "user": m.get("user") or (m.get("bot_profile") or {}).get("name"),
+        "is_bot": bool(m.get("bot_id")),
+        "text": text if len(text) <= MAX_READ_TEXT else text[:MAX_READ_TEXT] + " …[truncated]",
+    }
+    if m.get("thread_ts") and m.get("thread_ts") != m.get("ts"):
+        row["thread_ts"] = m["thread_ts"]
+    if m.get("reply_count"):
+        row["reply_count"] = m["reply_count"]
+    if m.get("files"):
+        row["files"] = [f.get("name") for f in m["files"]]
+    if m.get("reactions"):
+        row["reactions"] = [r.get("name") for r in m["reactions"]]
+    return row
 
 
 def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
@@ -384,7 +413,156 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
         row["is_archived"] = True
         return _ok({"channel": row})
 
+    @tool(
+        "post_message",
+        "Post a message to a channel (optionally as a reply in a thread), with "
+        "optional file attachments. Use it to write somewhere other than the "
+        "conversation you're replying in: your reply there is posted for you. "
+        "Mention people or agents with `<@USERID>` tokens in the text. The bot "
+        "must be a member of the channel.",
+        {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel id (C…/G…/D…) or name, with or without the leading #.",
+                },
+                "text": {"type": "string", "description": "Message text, Slack mrkdwn."},
+                "thread_ts": {
+                    "type": "string",
+                    "description": "Reply in this thread (the parent message's ts). Omit for a top-level post.",
+                },
+                "file_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Absolute paths of local files to upload into the same place.",
+                },
+            },
+            "required": ["channel", "text"],
+        },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+    )
+    @_guard("chat.postMessage")
+    async def post_message(args: dict[str, Any]) -> dict[str, Any]:
+        ref = (args.get("channel") or "").strip()
+        text = (args.get("text") or "").strip()
+        if not ref or not text:
+            return _err("post_message needs a channel and some text")
+        if re.fullmatch(r"D[A-Z0-9]{6,}", ref):
+            channel_id = ref
+        else:
+            channel = await _resolve_channel(slack, ref)
+            if channel is None:
+                return _err(f"No channel {ref} that the bot can see")
+            channel_id = channel["id"]
+        thread_ts = (args.get("thread_ts") or "").strip() or None
+        resp = await slack.chat_postMessage(channel=channel_id, text=text, thread_ts=thread_ts)
+        out: dict[str, Any] = {"channel": channel_id, "ts": resp.get("ts")}
+        paths = [p for p in (args.get("file_paths") or []) if isinstance(p, str) and p]
+        if paths:
+            await upload_files(slack, channel_id, thread_ts, paths)
+            out["uploaded"] = paths
+        log.info("posted to %s (ts=%s)", channel_id, out["ts"])
+        return _ok(out)
+
+    @tool(
+        "read_messages",
+        "Read recent messages from a channel, oldest first, or the replies in one "
+        "thread (pass thread_ts). Use `oldest` to fetch only what's new since a ts "
+        "you've already seen. The bot must be a member of the channel.",
+        {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel id (C…/G…/D…) or name, with or without the leading #.",
+                },
+                "thread_ts": {"type": "string", "description": "Read this thread's replies instead of the channel."},
+                "oldest": {"type": "string", "description": "Only messages after this ts."},
+                "limit": {"type": "integer", "description": "How many messages (default 20, max 100)."},
+            },
+            "required": ["channel"],
+        },
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    @_guard("conversations.history")
+    async def read_messages(args: dict[str, Any]) -> dict[str, Any]:
+        ref = (args.get("channel") or "").strip()
+        if not ref:
+            return _err("read_messages needs a channel id or name")
+        if re.fullmatch(r"D[A-Z0-9]{6,}", ref):
+            channel_id = ref
+        else:
+            channel = await _resolve_channel(slack, ref)
+            if channel is None:
+                return _err(f"No channel {ref} that the bot can see")
+            channel_id = channel["id"]
+        limit = max(1, min(int(args.get("limit") or 20), 100))
+        kwargs: dict[str, Any] = {"channel": channel_id, "limit": limit}
+        if args.get("oldest"):
+            kwargs["oldest"] = str(args["oldest"])
+        thread_ts = (args.get("thread_ts") or "").strip()
+        if thread_ts:
+            resp = await slack.conversations_replies(ts=thread_ts, **kwargs)
+            msgs = resp.get("messages") or []  # already oldest first
+        else:
+            resp = await slack.conversations_history(**kwargs)
+            msgs = list(reversed(resp.get("messages") or []))  # newest first from Slack
+        return _ok({
+            "channel": channel_id,
+            "messages": [_message_row(m) for m in msgs],
+            "has_more": bool(resp.get("has_more")),
+        })
+
+    @tool(
+        "add_reaction",
+        "Add an emoji reaction to a message. Needs the app's `reactions:write` scope.",
+        {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Channel id (C…/G…/D…) or name, with or without the leading #.",
+                },
+                "timestamp": {"type": "string", "description": "The message's ts."},
+                "name": {"type": "string", "description": "Emoji name without colons, e.g. white_check_mark."},
+            },
+            "required": ["channel", "timestamp", "name"],
+        },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+    )
+    @_guard("reactions.add")
+    async def add_reaction(args: dict[str, Any]) -> dict[str, Any]:
+        ref = (args.get("channel") or "").strip()
+        ts = (args.get("timestamp") or "").strip()
+        name = (args.get("name") or "").strip().strip(":")
+        if not ref or not ts or not name:
+            return _err("add_reaction needs a channel, timestamp and emoji name")
+        if re.fullmatch(r"D[A-Z0-9]{6,}", ref):
+            channel_id = ref
+        else:
+            channel = await _resolve_channel(slack, ref)
+            if channel is None:
+                return _err(f"No channel {ref} that the bot can see")
+            channel_id = channel["id"]
+        try:
+            await slack.reactions_add(channel=channel_id, timestamp=ts, name=name)
+        except SlackApiError as e:
+            data = e.response.data if isinstance(e.response.data, dict) else {}
+            if data.get("error") == "already_reacted":
+                return _ok({"channel": channel_id, "ts": ts, "name": name, "note": "already reacted"})
+            raise
+        return _ok({"channel": channel_id, "ts": ts, "name": name})
+
     return create_sdk_mcp_server(
         name=SERVER_NAME,
-        tools=[list_channels, list_users, create_channel, archive_channel],
+        tools=[
+            list_channels,
+            list_users,
+            create_channel,
+            archive_channel,
+            post_message,
+            read_messages,
+            add_reaction,
+        ],
     )

@@ -219,6 +219,18 @@ class SlackRenderer:
         self._last_flushed_len = 0
         self._last_flush_at = 0.0
 
+    async def delete(self) -> None:
+        """Remove the placeholder (or partial reply) this renderer posted. Used
+        when a turn another agent started ends with nothing to say: an empty
+        reply must leave no trace, or the exchange never ends."""
+        if self._ts is None or self._broken:
+            return
+        try:
+            await self._client.chat_delete(channel=self._channel, ts=self._ts)
+        except Exception:  # noqa: BLE001
+            log.exception("chat_delete (silent turn) failed")
+        self._ts = None
+
     async def replace_with(self, text: str) -> None:
         if self._ts is None or self._broken:
             return
