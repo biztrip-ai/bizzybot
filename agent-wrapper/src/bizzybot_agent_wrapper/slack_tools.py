@@ -37,7 +37,8 @@ PAGE_SIZE = 200
 TOOLS_PROMPT = """\
 You have `mcp__bizzybot__*` tools for the Slack workspace you're talking in
 (list_channels, list_users, create_channel, archive_channel, post_message,
-read_messages, add_reaction). Use them for anything about this workspace. Other
+read_messages, add_reaction, heartbeat). Use them for anything about this
+workspace. Other
 Slack tools you may have can point at a different workspace. Only archive a
 channel when the person asked for that specific channel to be archived.
 Your reply to the current conversation is posted for you; use post_message
@@ -46,7 +47,12 @@ or agent, write their Slack handle as `@handle` (the `name` from list_users,
 e.g. `@builder`) or their mention token `<@USERID>`; the bridge turns known
 handles into real mentions. Write the token with plain angle brackets, never
 HTML-escaped, and keep it out of backticks. Real names with spaces and
-unknown handles notify nobody."""
+unknown handles notify nobody.
+Before anything that blocks for more than about a minute (waiting on CI, a
+long test run, a slow build), call `heartbeat` with a one-line note saying
+what you're waiting for and roughly how long. It shows in the Slack message
+while you work, so the thread isn't silent. Prefer several short waits with a
+heartbeat between them over one long blocking wait."""
 
 # Slack error codes from conversations.archive, explained so the agent can tell
 # the person what to do instead of retrying.
@@ -418,6 +424,33 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
         return _ok({"channel": row})
 
     @tool(
+        "heartbeat",
+        "Say what you're doing while a turn runs. The note appears in the Slack "
+        "message as the current activity, so a long wait isn't silent. Call it "
+        "before anything that blocks for more than a minute, and again between "
+        "waits. It posts no new message and costs nothing.",
+        {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": "One line: what you're waiting for or working on, e.g. 'waiting on CI for PR #2784 (~8 min)'.",
+                },
+            },
+            "required": ["note"],
+        },
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    @_guard("heartbeat")
+    async def heartbeat(args: dict[str, Any]) -> dict[str, Any]:
+        # What the person sees comes from the tool call itself (slack_io.tool_label
+        # renders it as the running-activity line), so there is nothing to send.
+        note = (args.get("note") or "").strip()
+        if not note:
+            return _err("heartbeat needs a note")
+        return _ok({"noted": note[:200]})
+
+    @tool(
         "post_message",
         "Post a message to a channel (optionally as a reply in a thread), with "
         "optional file attachments. Use it to write somewhere other than the "
@@ -570,5 +603,6 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
             post_message,
             read_messages,
             add_reaction,
+            heartbeat,
         ],
     )

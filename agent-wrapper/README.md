@@ -170,6 +170,21 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 - Events are acked by sequence; if the agent-wrapper is offline, Central-Dispatch holds events
   and replays them on reconnect.
 
+## Long waits: `heartbeat`
+
+A turn can only post when it ends, so a tool that blocks for minutes (a CI
+wait, a long test run) leaves the thread looking dead. Two things fix that:
+
+- The running message shows the **current tool** as an activity line, and a
+  ticker re-renders it with the elapsed time (`ELAPSED_TICK_S`, default 60 s):
+  `💻 timeout 1800 gh pr checks … · 4m`.
+- The agent can call the `heartbeat` tool with a one-line note
+  (`⏳ waiting on CI for PR #2784 (~8 min)`). It posts no message and is
+  rendered the same way — the point is to say *why* it's waiting.
+
+Prefer several short waits with a `heartbeat` between them over one long
+blocking wait: the agent can't read new messages until its turn ends.
+
 ## Multi-agent hand-offs
 
 Several agents can pass work to each other in Slack (e.g. a PM agent
