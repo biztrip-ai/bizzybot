@@ -453,6 +453,9 @@ async def get_bot_user_id(slack: AsyncWebClient) -> Optional[str]:
 # and rename notices, pins…) must not start a turn.
 _USER_SUBTYPES = {None, "file_share", "thread_broadcast", "me_message"}
 
+# How often a running turn re-renders its activity line with elapsed minutes.
+ELAPSED_TICK_S = float(os.getenv("ELAPSED_TICK_S", "60") or 60)
+
 # channel id -> whether the bot created it. Cached both ways: a channel's
 # creator never changes.
 _owned_channels: dict[str, bool] = {}
@@ -748,6 +751,24 @@ async def handle_user_message(
     # nothing on screen must say so rather than leave the "thinking…"
     # placeholder, or a finished tool's label, up forever.
     rendered = False
+    # A tool that blocks for minutes (a CI wait, a long test run) streams
+    # nothing, so the message would sit on one unchanging label. This ticker
+    # re-renders the current label with the elapsed minutes, which is also the
+    # only sign of life when the agent forgets to call `heartbeat`.
+    activity = {"label": "", "since": time.monotonic()}
+
+    async def tick_elapsed() -> None:
+        while True:
+            await asyncio.sleep(ELAPSED_TICK_S)
+            label = activity["label"]
+            if not label:
+                continue
+            secs = time.monotonic() - activity["since"]
+            if secs >= ELAPSED_TICK_S:
+                elapsed = f"{int(secs // 60)}m" if secs >= 60 else f"{int(secs)}s"
+                await renderer.status(f"{label} · {elapsed}")
+
+    ticker = asyncio.create_task(tick_elapsed())
     try:
         async for chunk in session.send(text):
             if chunk.kind == "turn_start":
@@ -771,10 +792,13 @@ async def handle_user_message(
                 # sentinel strip: a reply that is only an ATTACH line renders no
                 # text, and counting it here would leave the placeholder standing.
                 rendered = True
+                activity["label"] = ""  # append() retires the status line
                 full_text.append(stripped)
                 await renderer.append(visible)
             elif chunk.kind == "tool_use":
-                await renderer.status(tool_label(chunk.name, chunk.args))
+                activity["label"] = tool_label(chunk.name, chunk.args)
+                activity["since"] = time.monotonic()
+                await renderer.status(activity["label"])
         if rendered:
             # The turn is over, so nothing is still running: retire any trailing
             # tool label before the last draw, or a finished reply ends on a line
@@ -805,6 +829,8 @@ async def handle_user_message(
         else:
             log.exception("session error on %s", thread_key)
             await renderer.replace_with(f":warning: error: `{e}`")
+    finally:
+        ticker.cancel()
 
     joined = "\n".join(full_text)
     paths = [m.group(1).strip() for m in ATTACH_RE.finditer(joined)]

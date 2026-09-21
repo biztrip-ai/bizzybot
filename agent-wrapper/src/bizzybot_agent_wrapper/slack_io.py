@@ -356,6 +356,14 @@ def tool_label(name: Optional[str], args: Optional[dict]) -> str:
         return f"🤖 {_clip(str(a.get('description') or 'subagent'))}"
     if name == "WebSearch":
         return f"🔎 searching {_clip(str(a.get('query', '')))}"
+    if name == "mcp__bizzybot__heartbeat":
+        return f"⏳ {_clip(str(a.get('note', 'working')))}"
+    if name == "mcp__bizzybot__post_message":
+        return f"💬 posting to {_clip(str(a.get('channel', '')))}"
+    if name == "mcp__bizzybot__read_messages":
+        return f"👀 reading {_clip(str(a.get('channel', '')))}"
+    if name == "mcp__bizzybot__add_reaction":
+        return f"✅ reacting :{_clip(str(a.get('name', '')))}:"
     if name == "mcp__bizzybot__list_channels":
         return "💬 listing Slack channels"
     if name == "mcp__bizzybot__list_users":
