@@ -954,6 +954,25 @@ class SessionManager:
         await session.close()
         return True
 
+    async def terminate(self, key: str) -> bool:
+        """Close a session's claude subprocess and forget the live session, but
+        KEEP its resume id — the next message in that thread picks the
+        conversation back up. Unlike `drop` (!clear), which forgets it.
+
+        This is !stop's last resort: the SDK's interrupt is a request the CLI
+        can ignore (it typically does while a tool call is in flight), and a
+        turn nothing can stop is worse than a killed subprocess."""
+        async with self._lock:
+            session = self._sessions.pop(key, None)
+        if session is None:
+            return False
+        try:
+            await asyncio.wait_for(session.close(), timeout=20)
+        except Exception:  # noqa: BLE001 — includes the 20s timeout
+            # Already unregistered, so the thread is usable again either way.
+            log.warning("terminate: closing session %s failed or hung", key, exc_info=True)
+        return True
+
     async def close_all(self) -> None:
         if self._reaper_task is not None:
             self._reaper_task.cancel()
