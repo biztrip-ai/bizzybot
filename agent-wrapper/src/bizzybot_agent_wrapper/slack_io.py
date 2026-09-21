@@ -18,6 +18,8 @@ from typing import Any, Optional
 import aiohttp
 from slack_sdk.web.async_client import AsyncWebClient
 
+from .mentions import directory_for
+
 log = logging.getLogger("agent-wrapper.slack")
 
 MAX_MSG_CHARS = 2800
@@ -187,9 +189,11 @@ class SlackRenderer:
             if now - self._last_flush_at < MIN_UPDATE_INTERVAL_S:
                 return
         try:
-            await self._client.chat_update(
-                channel=self._channel, ts=self._ts, text=self._render()
-            )
+            # `@handle` -> `<@U…>` and un-escape `&lt;@U…&gt;` so a mention the
+            # model wrote actually notifies (see mentions.py). Re-done on every
+            # push because the body is re-rendered whole each time.
+            text = await directory_for(self._client).resolve(self._render())
+            await self._client.chat_update(channel=self._channel, ts=self._ts, text=text)
             self._last_flushed_len = len(self._body)
             self._last_flush_at = now
         except Exception as e:  # noqa: BLE001 — must never reach the stream consumer
