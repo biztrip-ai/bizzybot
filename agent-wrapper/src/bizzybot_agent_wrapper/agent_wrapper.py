@@ -736,6 +736,7 @@ async def handle_user_message(
         )
 
     log.info("message thread=%s channel=%s len=%d files=%d", thread_key, channel, len(text), len(files))
+    _STOPPED_AT.pop(thread_key, None)  # a new turn: any earlier !stop is done
     session = await sessions.get_or_create(thread_key)
     # If a turn on this thread is already running, ours will queue behind it on
     # the session lock — tell the user rather than showing a frozen "thinking…".
@@ -797,8 +798,13 @@ async def handle_user_message(
                 await renderer.replace_with("_nothing new to report_")
     except Exception as e:  # noqa: BLE001 — surface any turn failure to Slack
         turn_ok = False
-        log.exception("session error on %s", thread_key)
-        await renderer.replace_with(f":warning: error: `{e}`")
+        if _was_stopped(thread_key):
+            # !stop ended this turn; the stop message already said so.
+            log.info("turn on %s ended after !stop: %s", thread_key, e)
+            await renderer.replace_with("_stopped._")
+        else:
+            log.exception("session error on %s", thread_key)
+            await renderer.replace_with(f":warning: error: `{e}`")
 
     joined = "\n".join(full_text)
     paths = [m.group(1).strip() for m in ATTACH_RE.finditer(joined)]
@@ -1165,19 +1171,65 @@ async def handle_clear(payload: dict, sessions: SessionManager, slack: AsyncWebC
     )
 
 
+# How long !stop waits for an interrupted turn to actually end before killing
+# the session's claude subprocess.
+STOP_GRACE_S = float(os.getenv("STOP_GRACE_S", "8"))
+
+# thread_key -> when !stop last acted on it. A stopped turn's stream ends in an
+# exception (interrupt or a killed subprocess); this tells that apart from a
+# genuine failure so the thread reads "stopped." and not ":warning: error".
+_STOPPED_AT: dict[str, float] = {}
+_STOP_MARK_TTL_S = 120.0
+
+
+def _mark_stopped(thread_key: str) -> None:
+    _STOPPED_AT[thread_key] = time.monotonic()
+
+
+def _was_stopped(thread_key: str) -> bool:
+    at = _STOPPED_AT.pop(thread_key, None)
+    return at is not None and time.monotonic() - at < _STOP_MARK_TTL_S
+
+
 async def handle_stop(payload: dict, sessions: SessionManager, slack: AsyncWebClient) -> None:
+    """!stop — end whatever is running in this thread.
+
+    The SDK's interrupt is a *request*: the CLI acts on it between steps, and a
+    turn parked in a long tool call can ignore it indefinitely. So we escalate —
+    interrupt, wait, then kill the subprocess. The thread's resume id survives a
+    kill, so the next message continues the same conversation."""
     channel, reply_ts, thread_key = payload.get("channel"), payload.get("reply_thread_ts"), payload.get("thread_key")
     if not thread_key or not channel:
         return
-    session = sessions.get(thread_key)
-    stopped = await session.interrupt() if session else False
     # A `!!` command runs outside any session, so stop that too.
-    if SHELL_RUNNER is not None and SHELL_RUNNER.stop(thread_key):
-        stopped = True
-    await slack.chat_postMessage(
-        channel=channel, thread_ts=reply_ts,
-        text=":octagonal_sign: stopped." if stopped else "_Nothing running._",
-    )
+    stopped_shell = SHELL_RUNNER is not None and SHELL_RUNNER.stop(thread_key)
+    session = sessions.get(thread_key)
+    interrupted = await session.interrupt() if session else False
+    if interrupted:
+        _mark_stopped(thread_key)
+
+    killed = False
+    if interrupted and session is not None:
+        deadline = time.monotonic() + STOP_GRACE_S
+        while session.is_busy() and time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
+        if session.is_busy():
+            log.warning(
+                "!stop: turn on %s ignored the interrupt after %.0fs — killing the "
+                "claude subprocess", thread_key, STOP_GRACE_S,
+            )
+            killed = await sessions.terminate(thread_key)
+
+    if killed:
+        text = (
+            ":octagonal_sign: stopped — the turn ignored the interrupt, so I restarted "
+            "its Claude session. The conversation is kept; just send your next message."
+        )
+    elif interrupted or stopped_shell:
+        text = ":octagonal_sign: stopped."
+    else:
+        text = "_Nothing running._"
+    await slack.chat_postMessage(channel=channel, thread_ts=reply_ts, text=text)
 
 
 async def handle_help(payload: dict, sessions: SessionManager, slack: AsyncWebClient) -> None:

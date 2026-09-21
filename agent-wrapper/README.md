@@ -95,8 +95,14 @@ it doesn't prefer those cached credentials over the OpenRouter token.
 - Responds to **@-mentions**, **direct messages**, and every message in
   channels the bot created.
 - Streams replies into a single Slack message, edited in place.
-- Meta commands: `!stop` (interrupt the running turn), `!clear` (reset the
+- Meta commands: `!stop` (end the running turn), `!clear` (reset the
   thread's session), `!help`.
+- **`!stop` escalates.** The SDK's interrupt is a request the CLI acts on
+  between steps, so a turn parked in a long tool call can ignore it. `!stop`
+  interrupts, waits `STOP_GRACE_S` (default 8s), and then kills that session's
+  `claude` subprocess. The thread's resume id survives, so the next message
+  continues the same conversation. The killed turn's message reads
+  *stopped*, not an error.
 - **`!!` shell commands:** a message starting with `!!` runs the rest as a
   shell command in `CLAUDE_CWD` and posts the output back — no Claude turn
   involved. **Only the agent's sponsor may do this**, and only when a sponsor
