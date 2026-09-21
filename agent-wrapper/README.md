@@ -145,6 +145,13 @@ it doesn't prefer those cached credentials over the OpenRouter token.
   naming who wrote it, e.g. `[Slack message from Jane Doe (@jane), user ID
   U0123 — mention as <@U0123>]`, so it can mention or invite that person
   without asking. Names come from `users.info` and are cached for an hour.
+- **Mentions by handle:** in everything the agent posts (its streamed reply
+  and `post_message`), `@handle` — a Slack username or display name in the
+  workspace — is turned into a real `<@U…>` mention, and an HTML-escaped
+  token the model wrote (`&lt;@U…&gt;`) is repaired. Unknown handles,
+  e-mail addresses and anything in backticks are left alone. The handle map
+  comes from `users.list`, cached for an hour and re-fetched on an unknown
+  handle at most once a minute.
 - **Slack workspace tools:** the agent gets an in-process MCP server,
   `bizzybot`, backed by the workspace's bot token: `list_channels`,
   `list_users`, `create_channel` (with optional topic, purpose and
@@ -165,7 +172,9 @@ dispatching a builder agent):
 - **Waking on another agent:** messages from bots are normally ignored. Set
   `AGENT_MENTIONS_FROM` to the other agents' Slack user, app or bot ids. A
   message from one of them wakes this agent only if it @-mentions it with a
-  real `<@U…>` token. The model is told the message came from an agent.
+  real `<@U…>` token — which, with the handle resolution above, is what
+  `@builder` in the sending agent's text becomes. The model is told the
+  message came from an agent.
 - **Silence ends the exchange:** when another agent starts a turn and the reply
   is empty, the "thinking…" placeholder is deleted and nothing is posted.
   A human's message still gets "_nothing new to report_".

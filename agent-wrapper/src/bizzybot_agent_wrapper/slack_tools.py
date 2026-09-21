@@ -23,6 +23,7 @@ from mcp.types import ToolAnnotations
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 
+from .mentions import directory_for
 from .slack_io import upload_files
 
 log = logging.getLogger("agent-wrapper.slack-tools")
@@ -41,8 +42,11 @@ Slack tools you may have can point at a different workspace. Only archive a
 channel when the person asked for that specific channel to be archived.
 Your reply to the current conversation is posted for you; use post_message
 only to write somewhere else (another channel or thread). To notify a person
-or agent, include their mention token `<@USERID>` (ids from list_users);
-plain "@name" text notifies nobody."""
+or agent, write their Slack handle as `@handle` (the `name` from list_users,
+e.g. `@builder`) or their mention token `<@USERID>`; the bridge turns known
+handles into real mentions. Write the token with plain angle brackets, never
+HTML-escaped, and keep it out of backticks. Real names with spaces and
+unknown handles notify nobody."""
 
 # Slack error codes from conversations.archive, explained so the agent can tell
 # the person what to do instead of retrying.
@@ -254,8 +258,8 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
     @tool(
         "list_users",
         "List people in this Slack workspace. Returns id, handle, real and display "
-        "name, title, bot/admin flags and timezone. Use the id to @-mention "
-        "someone as <@ID>. Deactivated accounts are skipped.",
+        "name, title, bot/admin flags and timezone. Mention someone as `@handle` "
+        "(the `name` column) or `<@ID>`. Deactivated accounts are skipped.",
         {
             "type": "object",
             "properties": {
@@ -418,7 +422,8 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
         "Post a message to a channel (optionally as a reply in a thread), with "
         "optional file attachments. Use it to write somewhere other than the "
         "conversation you're replying in: your reply there is posted for you. "
-        "Mention people or agents with `<@USERID>` tokens in the text. The bot "
+        "Mention people or agents as `@handle` (their Slack username) or with "
+        "`<@USERID>` tokens; known handles are turned into real mentions. The bot "
         "must be a member of the channel.",
         {
             "type": "object",
@@ -456,6 +461,7 @@ def build_slack_mcp_server(slack: AsyncWebClient) -> McpSdkServerConfig:
                 return _err(f"No channel {ref} that the bot can see")
             channel_id = channel["id"]
         thread_ts = (args.get("thread_ts") or "").strip() or None
+        text = await directory_for(slack).resolve(text)
         resp = await slack.chat_postMessage(channel=channel_id, text=text, thread_ts=thread_ts)
         out: dict[str, Any] = {"channel": channel_id, "ts": resp.get("ts")}
         paths = [p for p in (args.get("file_paths") or []) if isinstance(p, str) and p]

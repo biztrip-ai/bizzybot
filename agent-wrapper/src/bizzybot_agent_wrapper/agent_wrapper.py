@@ -82,7 +82,9 @@ A message typed by a person in Slack starts with a line like
   [Slack message from Jane Doe (@jane), user ID U0123 — mention as <@U0123>]
 naming who wrote it. Several people can post in one thread, so check it on each
 message. Use that user ID when you need theirs (to mention, invite or look them
-up) instead of asking for it. The line is added by the bridge, not the person."""
+up) instead of asking for it. The line is added by the bridge, not the person.
+To mention someone, write `@handle` (their Slack username, e.g. `@jane`) or the
+`<@U0123>` token; the bridge turns known handles into real mentions."""
 
 # Every thread runs in the same cwd (see build_session_manager), concurrently, so
 # the agent has to isolate its own edits and clean up what it starts. Advisory —
