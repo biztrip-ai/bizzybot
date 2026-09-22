@@ -1,3 +1,10 @@
+> **Moved.** Bizzybot now lives in
+> [biztrip-ai/cloud-agents](https://github.com/biztrip-ai/cloud-agents) under
+> `bizzybot/`, next to the provisioning skill and the agent protocols that use
+> it. Install the bridge from there:
+> `uv tool install "git+https://github.com/biztrip-ai/cloud-agents.git#subdirectory=bizzybot/agent-wrapper"`.
+> This repo is archived and kept for its history.
+
 # Bizzybot
 
 Integrate a Claude Code agent into your Slack workspace.
